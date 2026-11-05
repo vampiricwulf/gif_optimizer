@@ -1,8 +1,8 @@
 //! Lossless GIF re-encoder.
 //!
 //! Every output frame only contains the rectangle that changed since the
-//! previous frame, with unchanged pixels written as transparent (which LZW
-//! compresses extremely well). Disposal methods are chosen so any pixel that
+//! previous frame. Unchanged pixels are written as transparent or as their
+//! real color, whichever compresses better (see `lzw`). Disposal methods are chosen so any pixel that
 //! must become transparent in the next frame gets cleared. No colors are ever
 //! quantized: if a frame cannot be expressed exactly, encoding fails instead.
 
@@ -13,6 +13,7 @@ use anyhow::{bail, Context, Result};
 use gif::{DisposalMethod, Encoder, Frame, Repeat};
 
 use crate::composite::{composite_frames, rgb, Pixel, TRANSPARENT};
+use crate::lzw::{self, Choice};
 use crate::store::FrameStore;
 use crate::timeline::TimelineFrame;
 
@@ -277,16 +278,22 @@ pub fn encode(
             }
         };
 
-        let indices = syms
+        // Unchanged pixels may be written as transparent or, if the palette
+        // has it, as their real color; the LZW encoder picks per pixel.
+        let choices = syms
             .iter()
-            .map(|s| {
-                if *s == TRANSPARENT {
-                    transparent
-                } else {
-                    map.get(s).copied()
+            .zip(plan.rect.indices(w))
+            .map(|(s, i)| {
+                if *s != TRANSPARENT {
+                    return map.get(s).map(|&c| Choice::fixed(c));
                 }
+                let t = transparent?;
+                let alt = (current[i] != TRANSPARENT)
+                    .then(|| map.get(&current[i]).copied())
+                    .flatten();
+                Some(Choice { primary: t, alt })
             })
-            .collect::<Option<Vec<u8>>>()
+            .collect::<Option<Vec<Choice>>>()
             .with_context(|| format!("internal error: palette mismatch in frame {}", k + 1))?;
 
         let frame = Frame {
@@ -298,10 +305,10 @@ pub fn encode(
             width: plan.rect.w as u16,
             height: plan.rect.h as u16,
             palette,
-            buffer: Cow::Owned(indices),
+            buffer: Cow::Owned(lzw::encode(&choices)),
             ..Frame::default()
         };
-        encoder.write_frame(&frame)?;
+        encoder.write_lzw_pre_encoded_frame(&frame)?;
 
         base.copy_from_slice(&current);
         if plan.dispose == DisposalMethod::Background {

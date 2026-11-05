@@ -7,12 +7,18 @@
 //! directly with the frame that replaces it. Pass `--exact` to merge only
 //! pixel-identical frames, making the result lossless.
 //!
+//! GIFs are processed in parallel (`--jobs=N`, default: one per CPU core).
+//! If `gifsicle` is on the PATH, its `-O3` pass is tried on each result and
+//! kept only if it is smaller and passes the same verification; disable it
+//! with `--no-gifsicle`.
+//!
 //! Output:  `<exe dir>/gif_optimized/<original name>.gif`
 //! Temp:    `<exe dir>/gif_optimizing/` (removed when everything succeeds)
 //! Original GIFs are never modified or deleted.
 
 mod composite;
 mod encode;
+mod lzw;
 mod similar;
 mod store;
 mod timeline;
@@ -20,6 +26,8 @@ mod timeline;
 use std::fs::{self, File};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -42,12 +50,33 @@ struct Report {
     output_size: u64,
     /// Set when the original file was copied unchanged, with the reason.
     kept_original: Option<String>,
+    /// Whether gifsicle shrank the output further.
+    used_gifsicle: bool,
+}
+
+struct Options {
+    exact: bool,
+    gifsicle: bool,
+    /// Number of GIFs processed at the same time.
+    jobs: usize,
 }
 
 fn main() {
-    let pause = !std::env::args().any(|a| a == "--no-pause");
-    let exact = std::env::args().any(|a| a == "--exact");
-    let code = match run(exact) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    let pause = !has("--no-pause");
+    let jobs = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--jobs="))
+        .and_then(|n| n.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    let options = Options {
+        exact: has("--exact"),
+        gifsicle: !has("--no-gifsicle"),
+        jobs,
+    };
+    let code = match run(&options) {
         Ok(true) => 0,
         Ok(false) => 1,
         Err(e) => {
@@ -64,7 +93,7 @@ fn main() {
 }
 
 /// Returns `Ok(true)` if every GIF was processed without errors.
-fn run(exact: bool) -> Result<bool> {
+fn run(options: &Options) -> Result<bool> {
     let exe = std::env::current_exe().context("cannot locate the executable")?;
     let base_dir = exe
         .parent()
@@ -85,62 +114,60 @@ fn run(exact: bool) -> Result<bool> {
     fs::create_dir_all(&work_root)
         .with_context(|| format!("cannot create {}", work_root.display()))?;
 
-    let mut errors = 0;
-    let (mut total_in, mut total_out) = (0u64, 0u64);
-
-    for (i, src) in gifs.iter().enumerate() {
-        let name = src
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        println!("[{}/{}] {name}", i + 1, gifs.len());
-        let work_dir = work_root.join(work_dir_name(i, src));
-        let started = Instant::now();
-
-        match process_gif(src, &out_dir, &work_dir, exact) {
-            Ok(r) => {
-                total_in += r.original_size;
-                total_out += r.output_size;
-                let visual = if r.visual_unique_frames < r.unique_frames {
-                    format!(", {} after merging look-alikes", r.visual_unique_frames)
-                } else {
-                    String::new()
-                };
-                println!(
-                    "    frames: {} -> {} ({} unique{visual}{})",
-                    r.original_frames,
-                    r.output_frames,
-                    r.unique_frames,
-                    if r.cycles_folded > 1 {
-                        format!(", {} identical loops folded into one", r.cycles_folded)
-                    } else {
-                        String::new()
-                    }
-                );
-                match &r.kept_original {
-                    Some(reason) => println!("    kept original file: {reason}"),
-                    None => println!(
-                        "    size:   {} -> {} ({:.1}% smaller), {}",
-                        format_size(r.original_size),
-                        format_size(r.output_size),
-                        100.0 * (1.0 - r.output_size as f64 / r.original_size as f64),
-                        if r.visual_unique_frames < r.unique_frames {
-                            "look-alike frames merged (use --exact for lossless)"
-                        } else {
-                            "verified pixel-identical"
-                        }
-                    ),
-                }
-                println!("    done in {:.1}s", started.elapsed().as_secs_f64());
-            }
-            Err(e) => {
-                errors += 1;
-                eprintln!("    ERROR: {e:#}");
-                eprintln!("    temporary files kept in {}", work_dir.display());
-            }
+    let use_gifsicle = options.gifsicle && gifsicle_available();
+    let jobs = options.jobs.min(gifs.len());
+    println!(
+        "Processing {jobs} at a time; gifsicle {}.\n",
+        match (options.gifsicle, use_gifsicle) {
+            (false, _) => "disabled",
+            (true, false) => "not found (install it for slightly smaller files)",
+            (true, true) => "found, used for extra compression",
         }
-    }
+    );
+
+    // Workers take the next unprocessed GIF until none are left. Each GIF's
+    // report is printed in one piece when it finishes, so the order follows
+    // completion rather than the file list.
+    let next = AtomicUsize::new(0);
+    let print_lock = Mutex::new(());
+    let started_all = Instant::now();
+    let (errors, total_in, total_out) = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..jobs)
+            .map(|_| {
+                s.spawn(|| {
+                    let (mut errors, mut total_in, mut total_out) = (0usize, 0u64, 0u64);
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(src) = gifs.get(i) else { break };
+                        let work_dir = work_root.join(work_dir_name(i, src));
+                        let started = Instant::now();
+                        let result =
+                            process_gif(src, &out_dir, &work_dir, options.exact, use_gifsicle);
+                        let name = src.file_name().unwrap_or_default().to_string_lossy();
+                        let header = format!("[{}/{}] {name}", i + 1, gifs.len());
+                        let _guard = print_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        match result {
+                            Ok(r) => {
+                                total_in += r.original_size;
+                                total_out += r.output_size;
+                                println!("{header}\n{}", describe(&r, started));
+                            }
+                            Err(e) => {
+                                errors += 1;
+                                eprintln!("{header}\n    ERROR: {e:#}");
+                                eprintln!("    temporary files kept in {}", work_dir.display());
+                            }
+                        }
+                    }
+                    (errors, total_in, total_out)
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(join)
+            .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+    });
 
     println!();
     if total_in > 0 {
@@ -151,6 +178,7 @@ fn run(exact: bool) -> Result<bool> {
             format_size(total_in.saturating_sub(total_out))
         );
     }
+    println!("Finished in {:.1}s", started_all.elapsed().as_secs_f64());
     println!("Optimized GIFs are in {}", out_dir.display());
 
     if errors == 0 {
@@ -164,6 +192,57 @@ fn run(exact: bool) -> Result<bool> {
         );
         Ok(false)
     }
+}
+
+/// The per-file report lines, without the header.
+fn describe(r: &Report, started: Instant) -> String {
+    let visual = if r.visual_unique_frames < r.unique_frames {
+        format!(", {} after merging look-alikes", r.visual_unique_frames)
+    } else {
+        String::new()
+    };
+    let folded = if r.cycles_folded > 1 {
+        format!(", {} identical loops folded into one", r.cycles_folded)
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "    frames: {} -> {} ({} unique{visual}{folded})\n",
+        r.original_frames, r.output_frames, r.unique_frames,
+    );
+    match &r.kept_original {
+        Some(reason) => out += &format!("    kept original file: {reason}\n"),
+        None => {
+            out += &format!(
+                "    size:   {} -> {} ({:.1}% smaller), {}{}\n",
+                format_size(r.original_size),
+                format_size(r.output_size),
+                100.0 * (1.0 - r.output_size as f64 / r.original_size as f64),
+                if r.visual_unique_frames < r.unique_frames {
+                    "look-alike frames merged (use --exact for lossless)"
+                } else {
+                    "verified pixel-identical"
+                },
+                if r.used_gifsicle {
+                    ", gifsicle applied"
+                } else {
+                    ""
+                },
+            )
+        }
+    }
+    out += &format!("    done in {:.1}s", started.elapsed().as_secs_f64());
+    out
+}
+
+fn gifsicle_available() -> bool {
+    std::process::Command::new("gifsicle")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn find_gifs(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -199,7 +278,68 @@ fn work_dir_name(index: usize, src: &Path) -> String {
     format!("{:04}_{stem}", index + 1)
 }
 
-fn process_gif(src: &Path, out_dir: &Path, work_dir: &Path, exact: bool) -> Result<Report> {
+/// Joins a scoped thread, re-raising its panic if it had one.
+fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
+type Candidate = (
+    Result<Vec<u8>>,
+    (Vec<TimelineFrame>, gif::Repeat, usize),
+    usize,
+);
+
+/// Encodes the timeline with visually identical frames merged, or returns
+/// `None` if no frames look alike.
+fn lookalike_candidate(
+    store: &FrameStore,
+    raw: &[TimelineFrame],
+    info: &composite::GifInfo,
+) -> Result<Option<Candidate>> {
+    let (w, h) = (info.width as usize, info.height as usize);
+    let canonical = similar::group_similar(store, w, h)?;
+    let visual_unique = canonical
+        .iter()
+        .enumerate()
+        .filter(|&(i, &c)| i == c)
+        .count();
+    if visual_unique == store.unique_count() {
+        return Ok(None);
+    }
+    let plan = plan_timeline(raw, &canonical, info.repeat);
+    let encoded = optimize(store, &plan.0, info.width, info.height, plan.1);
+    Ok(Some((encoded, plan, visual_unique)))
+}
+
+/// Runs `gifsicle -O3` on `bytes`. Returns `None` if gifsicle is not
+/// installed or fails.
+fn gifsicle(bytes: &[u8], work_dir: &Path) -> Option<Vec<u8>> {
+    let (input, output) = (work_dir.join("pre.gif"), work_dir.join("gifsicle.gif"));
+    fs::write(&input, bytes).ok()?;
+    let status = std::process::Command::new("gifsicle")
+        .args(["-O3", "--no-warnings", "-o"])
+        .arg(&output)
+        .arg(&input)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    let result = status.success().then(|| fs::read(&output).ok()).flatten();
+    let _ = fs::remove_file(&input);
+    let _ = fs::remove_file(&output);
+    result
+}
+
+fn process_gif(
+    src: &Path,
+    out_dir: &Path,
+    work_dir: &Path,
+    exact: bool,
+    use_gifsicle: bool,
+) -> Result<Report> {
     if work_dir.exists() {
         fs::remove_dir_all(work_dir)?;
     }
@@ -219,40 +359,51 @@ fn process_gif(src: &Path, out_dir: &Path, work_dir: &Path, exact: bool) -> Resu
     }
 
     // 2. Drop redundant frames and re-encode, verifying against the expected
-    //    frames. Exact matching is always tried.
+    //    frames. Exact matching is always tried. In default mode, frames that
+    //    differ only by dithering noise are also tried as the same image, in
+    //    parallel. Merging look-alikes can make the changes between
+    //    consecutive frames larger, so it is kept only if the file shrinks.
     let identity: Vec<usize> = (0..store.unique_count()).collect();
     let exact_plan = plan_timeline(&raw, &identity, info.repeat);
-    let mut chosen = (
-        optimize(&store, &exact_plan.0, info.width, info.height, exact_plan.1),
-        exact_plan,
-        store.unique_count(),
-    );
+    let (exact_encoded, lookalike) = std::thread::scope(|s| {
+        let exact_job =
+            s.spawn(|| optimize(&store, &exact_plan.0, info.width, info.height, exact_plan.1));
+        let lookalike = if exact {
+            Ok(None)
+        } else {
+            lookalike_candidate(&store, &raw, &info)
+        };
+        (join(exact_job), lookalike)
+    });
+    let mut chosen = (exact_encoded, exact_plan, store.unique_count());
+    if let Some((encoded, plan, visual_unique)) = lookalike? {
+        let smaller = match (&encoded, &chosen.0) {
+            (Ok(new), Ok(old)) => new.len() < old.len(),
+            (Ok(_), Err(_)) => true,
+            (Err(_), _) => false,
+        };
+        if smaller {
+            chosen = (encoded, plan, visual_unique);
+        }
+    }
+    let (mut encoded, (timeline, repeat, cycles_folded), visual_unique_frames) = chosen;
 
-    // 3. Optionally treat frames that differ only by dithering noise as the
-    //    same image. Merging look-alikes can make the changes between
-    //    consecutive frames larger, so it is kept only if the file shrinks.
-    if !exact {
-        let (w, h) = (info.width as usize, info.height as usize);
-        let canonical = similar::group_similar(&store, w, h)?;
-        let visual_unique = canonical
-            .iter()
-            .enumerate()
-            .filter(|&(i, &c)| i == c)
-            .count();
-        if visual_unique < store.unique_count() {
-            let plan = plan_timeline(&raw, &canonical, info.repeat);
-            let encoded = optimize(&store, &plan.0, info.width, info.height, plan.1);
-            let smaller = match (&encoded, &chosen.0) {
-                (Ok(new), Ok(old)) => new.len() < old.len(),
-                (Ok(_), Err(_)) => true,
-                (Err(_), _) => false,
-            };
-            if smaller {
-                chosen = (encoded, plan, visual_unique);
+    // 3. Let gifsicle try to shrink the result further, if it is installed.
+    //    Its output is verified like our own before it is used.
+    let mut used_gifsicle = false;
+    if use_gifsicle {
+        if let Ok(bytes) = &encoded {
+            if let Some(g) = gifsicle(bytes, work_dir) {
+                if g.len() < bytes.len()
+                    && encode::verify(&g, &store, &timeline, info.width, info.height, repeat)
+                        .is_ok()
+                {
+                    encoded = Ok(g);
+                    used_gifsicle = true;
+                }
             }
         }
     }
-    let (encoded, (timeline, _, cycles_folded), visual_unique_frames) = chosen;
 
     let original_size = fs::metadata(src)?.len();
     let dest = out_dir.join(src.file_name().context("source has no file name")?);
@@ -284,6 +435,7 @@ fn process_gif(src: &Path, out_dir: &Path, work_dir: &Path, exact: bool) -> Resu
         original_size,
         output_size,
         kept_original,
+        used_gifsicle,
     };
 
     drop(store);
@@ -319,18 +471,17 @@ fn optimize(
     let plans = encode::plan_frames(store, timeline, width, height)?;
 
     // Per-frame palettes are smaller for some GIFs, one shared palette for
-    // others; try both and keep the smaller file.
-    let mut best = encode::encode(store, timeline, &plans, width, height, repeat, None)?;
-    if let Some(global) = encode::global_palette(&plans) {
-        let candidate = encode::encode(
-            store,
-            timeline,
-            &plans,
-            width,
-            height,
-            repeat,
-            Some(&global),
-        )?;
+    // others; try both in parallel and keep the smaller file.
+    let global = encode::global_palette(&plans);
+    let (local, shared) = std::thread::scope(|s| {
+        let shared = global.as_ref().map(|g| {
+            s.spawn(|| encode::encode(store, timeline, &plans, width, height, repeat, Some(g)))
+        });
+        let local = encode::encode(store, timeline, &plans, width, height, repeat, None);
+        (local, shared.map(join))
+    });
+    let mut best = local?;
+    if let Some(candidate) = shared.transpose()? {
         if candidate.len() < best.len() {
             best = candidate;
         }
@@ -466,7 +617,7 @@ mod tests {
         write_gif(&src, seeds, repeat, transparent);
         let original = fs::read(&src).unwrap();
 
-        let report = process_gif(&src, &out_dir, &work_dir, false).unwrap();
+        let report = process_gif(&src, &out_dir, &work_dir, false, false).unwrap();
 
         assert_eq!(fs::read(&src).unwrap(), original, "original was modified");
         assert!(!work_dir.exists(), "work dir not cleaned up");
@@ -569,11 +720,11 @@ mod tests {
             .collect();
         write_frames(&src, frames, Repeat::Infinite, false);
 
-        let exact = process_gif(&src, &out_dir, &root.join("work_exact"), true).unwrap();
+        let exact = process_gif(&src, &out_dir, &root.join("work_exact"), true, false).unwrap();
         assert_eq!(exact.unique_frames, 6, "dithered frames should all differ");
         assert_eq!(exact.cycles_folded, 1);
 
-        let r = process_gif(&src, &out_dir, &root.join("work"), false).unwrap();
+        let r = process_gif(&src, &out_dir, &root.join("work"), false, false).unwrap();
         assert_eq!(r.visual_unique_frames, 2);
         assert_eq!(r.output_frames, 2);
         assert_eq!(r.cycles_folded, 3);

@@ -8,6 +8,9 @@ description = "Losslessly removes redundant frames from GIFs in the executable's
 anyhow = "1"
 gif = "0.14"
 
+[dev-dependencies]
+weezl = "0.1"
+
 [profile.release]
 opt-level = 3
 lto = true
