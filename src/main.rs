@@ -114,14 +114,16 @@ fn run(options: &Options) -> Result<bool> {
     fs::create_dir_all(&work_root)
         .with_context(|| format!("cannot create {}", work_root.display()))?;
 
-    let use_gifsicle = options.gifsicle && gifsicle_available();
+    let gifsicle_version = options.gifsicle.then(gifsicle_version).flatten();
+    let use_gifsicle = gifsicle_version.is_some();
     let jobs = options.jobs.min(gifs.len());
     println!(
         "Processing {jobs} at a time; gifsicle {}.\n",
-        match (options.gifsicle, use_gifsicle) {
-            (false, _) => "disabled",
-            (true, false) => "not found (install it for slightly smaller files)",
-            (true, true) => "found, used for extra compression",
+        match (options.gifsicle, &gifsicle_version) {
+            (false, _) => "disabled".to_string(),
+            (true, None) => "not found (install it for slightly smaller files)".to_string(),
+            // Output can differ between gifsicle versions, so name it.
+            (true, Some(v)) => format!("found ({v}), used for extra compression"),
         }
     );
 
@@ -235,14 +237,25 @@ fn describe(r: &Report, started: Instant) -> String {
     out
 }
 
-fn gifsicle_available() -> bool {
-    std::process::Command::new("gifsicle")
+/// First line of `gifsicle --version`, or `None` if gifsicle is not usable.
+fn gifsicle_version() -> Option<String> {
+    let output = std::process::Command::new("gifsicle")
         .arg("--version")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().next().unwrap_or("").trim();
+    Some(
+        if line.is_empty() {
+            "unknown version"
+        } else {
+            line
+        }
+        .to_string(),
+    )
 }
 
 fn find_gifs(dir: &Path) -> Result<Vec<PathBuf>> {
