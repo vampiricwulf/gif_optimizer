@@ -1,0 +1,4 @@
+* text=auto
+# Cargo always writes LF; keep Git from flagging it on every build.
+Cargo.lock text eol=lf
+*.gif binary
