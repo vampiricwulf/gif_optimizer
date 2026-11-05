@@ -26,7 +26,12 @@ impl Choice {
     }
 }
 
-const MAX_CODE: u16 = 4095;
+/// The dictionary is reset once it holds codes up to `MAX_CODE - 1`. Codes
+/// up to 4095 are allowed, but stopping at 4092 matches the encoder behind
+/// many real-world GIFs. Their pixel data (likely from lossy LZW) follows
+/// that encoder's dictionary exactly and can need half as many codes when
+/// the reset points line up; elsewhere the earlier reset costs almost nothing.
+const MAX_CODE: u16 = 4093;
 /// How far ahead to look when deciding between two options.
 const LOOKAHEAD: usize = 48;
 
@@ -118,7 +123,28 @@ pub fn min_code_size(pixels: &[Choice]) -> u8 {
 
 /// Encodes `pixels` and returns the minimum code size byte followed by the
 /// LZW stream, as expected by `gif::Encoder::write_lzw_pre_encoded_frame`.
+///
+/// Also tries writing every pixel with its real color where it has one,
+/// since that can recreate the source encoder's exact strings (see
+/// `MAX_CODE`), and returns whichever result is shorter.
 pub fn encode(pixels: &[Choice]) -> Vec<u8> {
+    let picked = encode_greedy(pixels);
+    if pixels.iter().all(|p| p.alt.is_none()) {
+        return picked;
+    }
+    let colors: Vec<Choice> = pixels
+        .iter()
+        .map(|p| Choice::fixed(p.alt.unwrap_or(p.primary)))
+        .collect();
+    let colored = encode_greedy(&colors);
+    if colored.len() < picked.len() {
+        colored
+    } else {
+        picked
+    }
+}
+
+fn encode_greedy(pixels: &[Choice]) -> Vec<u8> {
     let min_size = min_code_size(pixels);
     let clear: u16 = 1 << min_size;
     let eoi = clear + 1;
@@ -254,6 +280,6 @@ mod tests {
             .iter()
             .map(|p| Choice::fixed(p.alt.unwrap_or(p.primary)))
             .collect();
-        assert!(encode(&pixels).len() < encode(&fixed).len());
+        assert!(encode_greedy(&pixels).len() < encode_greedy(&fixed).len());
     }
 }
