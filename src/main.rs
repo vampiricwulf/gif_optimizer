@@ -46,6 +46,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{bail, Context, Result};
 
 use composite::composite_frames;
+use lzw::Effort;
 use output::{Event, FileResult, Kind, Output, Sink};
 use progress::{is_stopped, Progress, Stage};
 use store::FrameStore;
@@ -436,6 +437,8 @@ fn run(options: &Options, out: &Output, stop: &AtomicBool) -> Result<bool> {
     let gifsicle_version = options.gifsicle.then(gifsicle_version).flatten();
     let use_gifsicle = gifsicle_version.is_some();
     let workers = options.jobs.min(jobs.len());
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    encode::set_threads((cores / workers).max(1));
     out.line(format!(
         "Processing {workers} at a time; gifsicle {}.\n",
         match (options.gifsicle, &gifsicle_version) {
@@ -697,21 +700,15 @@ fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
         .unwrap_or_else(|e| std::panic::resume_unwind(e))
 }
 
-type Candidate = (
-    Result<Vec<u8>>,
-    (Vec<TimelineFrame>, gif::Repeat, usize),
-    usize,
-);
-
-/// Encodes the timeline with visually identical frames merged, or returns
-/// `None` if no frames look alike. The caller reserves progress for
-/// grouping (one unit per stored frame) and `4 * raw.len()` for encoding.
+/// The candidate with visually identical frames merged, or `None` if no
+/// frames look alike. The caller reserves progress for grouping (one unit
+/// per stored frame) and `CANDIDATE_PASSES * raw.len()` for the candidate.
 fn lookalike_candidate(
     store: &FrameStore,
     raw: &[TimelineFrame],
     info: &composite::GifInfo,
     progress: &Progress,
-) -> Result<Option<Candidate>> {
+) -> Result<Option<Result<Candidate>>> {
     let (w, h) = (info.width as usize, info.height as usize);
     let canonical = similar::group_similar(store, w, h, progress)?;
     let visual_unique = canonical
@@ -720,13 +717,19 @@ fn lookalike_candidate(
         .filter(|&(i, &c)| i == c)
         .count();
     if visual_unique == store.unique_count() {
-        progress.skip(OPTIMIZE_PASSES * raw.len());
+        progress.skip(CANDIDATE_PASSES * raw.len());
         return Ok(None);
     }
     let plan = plan_timeline(raw, &canonical, info.repeat);
-    progress.skip(OPTIMIZE_PASSES * raw.len().saturating_sub(plan.0.len()));
-    let encoded = optimize(store, &plan.0, info.width, info.height, plan.1, progress);
-    Ok(Some((encoded, plan, visual_unique)))
+    progress.skip(CANDIDATE_PASSES * raw.len().saturating_sub(plan.0.len()));
+    Ok(Some(candidate(
+        store,
+        plan,
+        visual_unique,
+        info.width,
+        info.height,
+        progress,
+    )))
 }
 
 /// Runs `gifsicle -O3` on `bytes`. Returns `None` if gifsicle is not
@@ -805,23 +808,32 @@ fn process_gif(
         bail!("GIF contains no frames");
     }
 
-    // 2. Drop redundant frames and re-encode, verifying against the expected
-    //    frames. Exact matching is always tried. In default mode, frames that
-    //    differ only by dithering noise are also tried as the same image, in
-    //    parallel. Merging look-alikes can make the changes between
-    //    consecutive frames larger, so it is kept only if the file shrinks.
+    // 2. Drop redundant frames and work out candidate encodings. Exact
+    //    matching is always tried. In default mode, frames that differ only
+    //    by dithering noise are also tried as the same image, in parallel.
+    //    Merging look-alikes can make the changes between consecutive frames
+    //    larger, so it is kept only if the file shrinks.
     progress.stage(Stage::Optimizing)?;
     let identity: Vec<usize> = (0..store.unique_count()).collect();
     let exact_plan = plan_timeline(&raw, &identity, info.repeat);
-    // Reserve all the work up front, so the fraction done only grows.
-    progress.expect(OPTIMIZE_PASSES * exact_plan.0.len());
+    // Reserve all the work up front, so the fraction done only grows. The
+    // final encoding's length is not known yet; no timeline is longer than
+    // the original.
+    progress.expect(CANDIDATE_PASSES * exact_plan.0.len() + final_units() * raw.len());
     if !exact {
-        progress.expect(store.unique_count() + OPTIMIZE_PASSES * raw.len());
+        progress.expect(store.unique_count() + CANDIDATE_PASSES * raw.len());
     }
-    let (exact_encoded, lookalike) = std::thread::scope(|s| {
+    let (exact_candidate, lookalike) = std::thread::scope(|s| {
         let exact_job = s.spawn(|| {
-            let (timeline, repeat) = (&exact_plan.0, exact_plan.1);
-            optimize(&store, timeline, info.width, info.height, repeat, progress)
+            let (w, h) = (info.width, info.height);
+            candidate(
+                &store,
+                exact_plan.clone(),
+                store.unique_count(),
+                w,
+                h,
+                progress,
+            )
         });
         let lookalike = if exact {
             Ok(None)
@@ -832,20 +844,49 @@ fn process_gif(
     });
     // A stopped candidate fails like a broken one; do not mistake it for that.
     progress.check()?;
-    let mut chosen = (exact_encoded, exact_plan, store.unique_count());
-    if let Some((encoded, plan, visual_unique)) = lookalike? {
-        let smaller = match (&encoded, &chosen.0) {
-            (Ok(new), Ok(old)) => new.len() < old.len(),
-            (Ok(_), Err(_)) => true,
-            (Err(_), _) => false,
-        };
-        if smaller {
-            chosen = (encoded, plan, visual_unique);
+    let mut failures = Vec::new();
+    let mut candidates = Vec::new();
+    for result in [Some(exact_candidate), lookalike?].into_iter().flatten() {
+        match result {
+            Ok(c) => candidates.push(c),
+            Err(e) => failures.push(e),
         }
     }
-    let (mut encoded, (timeline, repeat, cycles_folded), visual_unique_frames) = chosen;
 
-    // 3. Let gifsicle try to shrink the result further, if it is installed.
+    // 3. Encode the smallest candidate with the slow clear code search and
+    //    verify it, falling back to the next one if that fails.
+    candidates.sort_by_key(|c| c.fast_size);
+    let first_len = candidates.first().map_or(0, |c| c.timeline.len());
+    progress.skip(final_units() * raw.len().saturating_sub(first_len));
+    let mut chosen = None;
+    for c in candidates {
+        match finalize(&store, &c, info.width, info.height, progress) {
+            Ok(bytes) => {
+                chosen = Some((bytes, c));
+                break;
+            }
+            Err(e) => {
+                progress.check()?;
+                failures.push(e);
+            }
+        }
+    }
+    let (mut encoded, timeline, repeat, cycles_folded, visual_unique_frames) = match chosen {
+        Some((bytes, c)) => (
+            Ok(bytes),
+            c.timeline,
+            c.repeat,
+            c.cycles_folded,
+            c.visual_unique,
+        ),
+        None => {
+            let (timeline, repeat, folded) = exact_plan;
+            let e = failures.into_iter().next().expect("a candidate failed");
+            (Err(e), timeline, repeat, folded, store.unique_count())
+        }
+    };
+
+    // 4. Let gifsicle try to shrink the result further, if it is installed.
     //    Its output is verified like our own before it is used.
     let mut used_gifsicle = false;
     if use_gifsicle {
@@ -959,57 +1000,114 @@ fn plan_timeline(
     collapse_repeats(merge_consecutive(&grouped), repeat)
 }
 
-/// Passes over the timeline in `optimize`: planning, encoding with local
-/// and with global palettes, and verifying.
-const OPTIMIZE_PASSES: usize = 4;
+/// One way to encode a GIF, sized with fast LZW compression. The clear code
+/// search takes far longer than anything else, but changes every
+/// candidate's size by about the same few percent, so only the smallest
+/// candidate gets it.
+struct Candidate {
+    timeline: Vec<TimelineFrame>,
+    repeat: gif::Repeat,
+    cycles_folded: usize,
+    /// Distinct images left in `timeline`'s source after grouping.
+    visual_unique: usize,
+    plans: Vec<encode::FramePlan>,
+    /// The shared palette, if it beat per-frame palettes.
+    global: Option<encode::GlobalPalette>,
+    fast_size: usize,
+}
 
-/// Encodes and verifies `timeline`. The caller reserves `OPTIMIZE_PASSES`
-/// progress units per frame.
-fn optimize(
+/// Progress units per frame for a candidate: planning, then fast encoding
+/// with per-frame and with shared palettes.
+const CANDIDATE_PASSES: usize = 3;
+
+/// Progress units per frame for `finalize`: the slow encoding, then
+/// verifying.
+fn final_units() -> usize {
+    encode::units(Effort::Best) + 1
+}
+
+/// Plans `timeline` and picks the smaller palette layout. The caller
+/// reserves `CANDIDATE_PASSES` progress units per frame.
+fn candidate(
     store: &FrameStore,
-    timeline: &[TimelineFrame],
+    (timeline, repeat, cycles_folded): (Vec<TimelineFrame>, gif::Repeat, usize),
+    visual_unique: usize,
     width: u16,
     height: u16,
-    repeat: gif::Repeat,
     progress: &Progress,
-) -> Result<Vec<u8>> {
-    let plans = encode::plan_frames(store, timeline, width, height, progress)?;
+) -> Result<Candidate> {
+    let plans = encode::plan_frames(store, &timeline, width, height, progress)?;
 
     // Per-frame palettes are smaller for some GIFs, one shared palette for
-    // others; try both in parallel and keep the smaller file.
+    // others; try both in parallel.
     let global = encode::global_palette(&plans);
     if global.is_none() {
         progress.skip(timeline.len());
     }
+    let fast_size = &|g: Option<&encode::GlobalPalette>| {
+        encode::encode(
+            store,
+            &timeline,
+            &plans,
+            width,
+            height,
+            repeat,
+            g,
+            Effort::Fast,
+            progress,
+        )
+        .map(|bytes| bytes.len())
+    };
     let (local, shared) = std::thread::scope(|s| {
-        let shared = global.as_ref().map(|g| {
-            s.spawn(|| {
-                encode::encode(
-                    store,
-                    timeline,
-                    &plans,
-                    width,
-                    height,
-                    repeat,
-                    Some(g),
-                    progress,
-                )
-            })
-        });
-        let local = encode::encode(
-            store, timeline, &plans, width, height, repeat, None, progress,
-        );
-        (local, shared.map(join))
+        let shared = global.as_ref().map(|g| s.spawn(move || fast_size(Some(g))));
+        (fast_size(None), shared.map(join))
     });
-    let mut best = local?;
-    if let Some(candidate) = shared.transpose()? {
-        if candidate.len() < best.len() {
-            best = candidate;
-        }
-    }
+    let local = local?;
+    let (global, fast_size) = match shared.transpose()? {
+        Some(size) if size < local => (global, size),
+        _ => (None, local),
+    };
+    Ok(Candidate {
+        timeline,
+        repeat,
+        cycles_folded,
+        visual_unique,
+        plans,
+        global,
+        fast_size,
+    })
+}
 
-    encode::verify(&best, store, timeline, width, height, repeat, progress)?;
-    Ok(best)
+/// Encodes `c` as small as possible and verifies the result. The caller
+/// reserves `final_units()` progress units per frame.
+fn finalize(
+    store: &FrameStore,
+    c: &Candidate,
+    width: u16,
+    height: u16,
+    progress: &Progress,
+) -> Result<Vec<u8>> {
+    let bytes = encode::encode(
+        store,
+        &c.timeline,
+        &c.plans,
+        width,
+        height,
+        c.repeat,
+        c.global.as_ref(),
+        Effort::Best,
+        progress,
+    )?;
+    encode::verify(
+        &bytes,
+        store,
+        &c.timeline,
+        width,
+        height,
+        c.repeat,
+        progress,
+    )?;
+    Ok(bytes)
 }
 
 fn format_size(bytes: u64) -> String {

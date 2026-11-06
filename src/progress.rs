@@ -115,8 +115,13 @@ impl<'a> Progress<'a> {
 
     /// Counts one unit of work as done; fails if a stop was requested.
     pub fn tick(&self) -> Result<()> {
+        self.advance(1)
+    }
+
+    /// Counts `n` units of work as done; fails if a stop was requested.
+    pub fn advance(&self, n: usize) -> Result<()> {
         self.check()?;
-        self.update(false, |s| s.done += 1);
+        self.update(false, |s| s.done += n);
         Ok(())
     }
 

@@ -10,6 +10,17 @@
 //! candidate positions picks where to clear it, which saves about 2% over
 //! clearing at a fixed size.
 
+/// How hard to try to make the output small.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Effort {
+    /// Clear the dictionary whenever it is full. Many times faster than
+    /// `Best` and only a few percent larger, so it is good enough to tell
+    /// which of several ways to encode a GIF is smallest.
+    Fast,
+    /// Search for the best clear code positions.
+    Best,
+}
+
 /// Index to write for one pixel, with an optional equally valid alternative.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Choice {
@@ -179,9 +190,13 @@ pub fn min_code_size(pixels: &[Choice]) -> u8 {
 /// Also tries writing every pixel with its real color where it has one,
 /// since that can recreate the source encoder's exact strings (see
 /// `COMMON_RESET`), and returns whichever result is shorter.
-pub fn encode(pixels: &[Choice]) -> Vec<u8> {
+pub fn encode(pixels: &[Choice], effort: Effort) -> Vec<u8> {
+    let run = match effort {
+        Effort::Fast => encode_simple,
+        Effort::Best => encode_flexible,
+    };
     if pixels.iter().all(|p| p.alt.is_none()) {
-        return encode_flexible(pixels);
+        return run(pixels);
     }
     let colors: Vec<Choice> = pixels
         .iter()
@@ -189,10 +204,50 @@ pub fn encode(pixels: &[Choice]) -> Vec<u8> {
         .collect();
     // The search is slow, so it only refines the more promising variant.
     if chain_cost(&colors) < chain_cost(pixels) {
-        encode_flexible(&colors)
+        run(&colors)
     } else {
-        encode_flexible(pixels)
+        run(pixels)
     }
+}
+
+/// Encodes `pixels`, clearing the dictionary as soon as it is full.
+fn encode_simple(pixels: &[Choice]) -> Vec<u8> {
+    let n = pixels.len();
+    let min_size = min_code_size(pixels);
+    let clear: u16 = 1 << min_size;
+    let eoi = clear + 1;
+    let mut dict = Dict::new(min_size);
+    let mut w = BitWriter {
+        out: vec![min_size],
+        acc: 0,
+        bits: 0,
+    };
+    w.write(clear, min_size + 1);
+    if n == 0 {
+        w.write(eoi, min_size + 1);
+        return w.finish();
+    }
+    let mut start = 0;
+    while start < n {
+        let mut end = n;
+        let seg = segment(
+            &mut dict,
+            pixels,
+            min_size,
+            start,
+            Some(&mut w),
+            |pos, next, _| {
+                let full = next >= MAX_CODE;
+                if full {
+                    end = pos;
+                }
+                !full
+            },
+        );
+        w.write(if end == n { eoi } else { clear }, seg.end_size);
+        start = end;
+    }
+    w.finish()
 }
 
 /// Bits needed when clearing the dictionary at every `COMMON_RESET`.
@@ -427,11 +482,16 @@ mod tests {
     }
 
     fn check(pixels: &[Choice]) {
-        let out = decode(&encode(pixels));
-        assert_eq!(out.len(), pixels.len());
-        for (o, p) in out.iter().zip(pixels) {
-            assert!(p.options().any(|i| i == *o), "{o} not in {p:?}");
+        let fast = encode(pixels, Effort::Fast);
+        let best = encode(pixels, Effort::Best);
+        for data in [&fast, &best] {
+            let out = decode(data);
+            assert_eq!(out.len(), pixels.len());
+            for (o, p) in out.iter().zip(pixels) {
+                assert!(p.options().any(|i| i == *o), "{o} not in {p:?}");
+            }
         }
+        assert!(best.len() <= fast.len() + 2, "the search should not lose");
     }
 
     #[test]

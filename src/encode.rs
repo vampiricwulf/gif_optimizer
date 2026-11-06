@@ -8,12 +8,14 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use gif::{DisposalMethod, Encoder, Frame, Repeat};
 
 use crate::composite::{composite_frames, rgb, Pixel, TRANSPARENT};
-use crate::lzw::{self, Choice};
+use crate::lzw::{self, Choice, Effort};
 use crate::progress::Progress;
 use crate::store::FrameStore;
 use crate::timeline::TimelineFrame;
@@ -239,7 +241,73 @@ pub fn global_palette(plans: &[FramePlan]) -> Option<GlobalPalette> {
     })
 }
 
-/// Writes the planned frames. Ticks `progress` once per frame.
+/// Threads used to compress the frames of one `encode` call; 0 means one
+/// per CPU core.
+static THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets how many threads each `encode` call uses, so that GIFs processed
+/// in parallel share the CPU instead of each trying to use all of it.
+pub fn set_threads(n: usize) {
+    THREADS.store(n, Ordering::Relaxed);
+}
+
+fn threads() -> usize {
+    match THREADS.load(Ordering::Relaxed) {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    }
+}
+
+/// Progress units `encode` counts per frame. The clear code search takes
+/// many times longer than anything else done per frame.
+pub fn units(effort: Effort) -> usize {
+    match effort {
+        Effort::Fast => 1,
+        Effort::Best => 16,
+    }
+}
+
+/// `f` applied to every item, using up to `threads` threads. Results keep
+/// the order of `items`.
+fn parallel_map<T: Sync, R: Send>(
+    items: &[T],
+    threads: usize,
+    f: impl Fn(&T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    if threads <= 1 || items.len() <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let results: Vec<Mutex<Option<Result<R>>>> = items.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(items.len()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(i) else { break };
+                let result = f(item);
+                *results[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|r| {
+            r.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("every item is processed")
+        })
+        .collect()
+}
+
+/// A frame ready to be compressed.
+struct Pending {
+    frame: Frame<'static>,
+    choices: Vec<Choice>,
+}
+
+/// Writes the planned frames. Frames are prepared in order, since each
+/// depends on the canvas the previous ones leave, then compressed in
+/// parallel batches. Counts `units(effort)` on `progress` per frame.
 #[allow(clippy::too_many_arguments)]
 pub fn encode(
     store: &FrameStore,
@@ -249,6 +317,7 @@ pub fn encode(
     height: u16,
     repeat: Repeat,
     global: Option<&GlobalPalette>,
+    effort: Effort,
     progress: &Progress,
 ) -> Result<Vec<u8>> {
     let w = width as usize;
@@ -261,9 +330,13 @@ pub fn encode(
     encoder.set_repeat(repeat)?;
 
     let mut base = vec![TRANSPARENT; w * height as usize];
+    // A batch holds one frame per thread, which bounds the memory used by
+    // frames waiting to be compressed.
+    let threads = threads();
+    let mut batch: Vec<Pending> = Vec::with_capacity(threads);
 
     for (k, (tf, plan)) in timeline.iter().zip(plans).enumerate() {
-        progress.tick()?;
+        progress.check()?;
         let current = store.load(tf.id)?;
         let syms = symbols(&current, &base, w, plan.rect, plan.mode);
 
@@ -313,10 +386,20 @@ pub fn encode(
             width: plan.rect.w as u16,
             height: plan.rect.h as u16,
             palette,
-            buffer: Cow::Owned(lzw::encode(&choices)),
             ..Frame::default()
         };
-        encoder.write_lzw_pre_encoded_frame(&frame)?;
+        batch.push(Pending { frame, choices });
+        if batch.len() == threads || k + 1 == timeline.len() {
+            let buffers = parallel_map(&batch, threads, |p| {
+                let data = lzw::encode(&p.choices, effort);
+                progress.advance(units(effort))?;
+                Ok(data)
+            })?;
+            for (mut p, data) in batch.drain(..).zip(buffers) {
+                p.frame.buffer = Cow::Owned(data);
+                encoder.write_lzw_pre_encoded_frame(&p.frame)?;
+            }
+        }
 
         base.copy_from_slice(&current);
         if plan.dispose == DisposalMethod::Background {
