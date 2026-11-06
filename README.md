@@ -19,7 +19,14 @@ decoded again and checked frame by frame before it is used.
   pass is tried on each result. It is kept only if it is smaller and passes
   the same verification.
 
-If a result is not smaller than the original, the original is kept.
+- **Repairs cut-off files.** GIFs that end too early, as interrupted
+  downloads do, are repaired first: a missing end marker is added, and a
+  last frame that was only partly written is dropped. The report says what
+  was repaired, and the repaired result is written even if it is not
+  smaller.
+
+Otherwise, if a result is not smaller than the original, the original is
+kept.
 
 ## Usage
 

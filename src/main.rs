@@ -31,6 +31,7 @@ mod encode;
 mod lzw;
 mod output;
 mod progress;
+mod repair;
 mod similar;
 mod store;
 mod timeline;
@@ -97,6 +98,8 @@ struct Report {
     kept_original: Option<String>,
     /// Whether gifsicle shrank the output further.
     used_gifsicle: bool,
+    /// How the source was repaired before optimizing, if it was damaged.
+    repair: Option<repair::Repair>,
 }
 
 #[derive(Clone)]
@@ -664,8 +667,16 @@ fn describe(r: &Report, started: Instant) -> Vec<(Kind, String)> {
             r.original_frames, r.output_frames, r.unique_frames,
         ),
     )];
+    if let Some(repair) = r.repair {
+        lines.push((Kind::Warning, format!("    repaired: {repair}")));
+    }
+    let kept = if r.repair.is_some() {
+        "wrote the repaired file"
+    } else {
+        "kept original file"
+    };
     match &r.kept_original {
-        Some(reason) => lines.push((Kind::Warning, format!("    kept original file: {reason}"))),
+        Some(reason) => lines.push((Kind::Warning, format!("    {kept}: {reason}"))),
         None => lines.push((
             Kind::Good,
             format!(
@@ -675,6 +686,8 @@ fn describe(r: &Report, started: Instant) -> Vec<(Kind, String)> {
                 100.0 * (1.0 - r.output_size as f64 / r.original_size as f64),
                 if r.visual_unique_frames < r.unique_frames {
                     "look-alike frames merged (use --exact for lossless)"
+                } else if r.repair.is_some() {
+                    "verified against the repaired frames"
                 } else {
                     "verified pixel-identical"
                 },
@@ -864,9 +877,11 @@ fn process_gif(
 
     // 1. Break the GIF into fully composited still frames, storing each
     //    distinct image only once.
+    //    A file that ends too early is repaired first.
     let mut raw = Vec::new();
-    let file = File::open(src).with_context(|| format!("cannot open {}", src.display()))?;
-    let info = composite_frames(file, |canvas, delay| {
+    let original = fs::read(src).with_context(|| format!("cannot read {}", src.display()))?;
+    let (source, repair) = repair::repair(&original);
+    let info = composite_frames(&*source, |canvas, delay| {
         progress.tick()?;
         let id = store.insert(canvas)?;
         raw.push(TimelineFrame { id, delay });
@@ -975,7 +990,7 @@ fn process_gif(
     progress.check()?;
 
     let src_meta = fs::metadata(src)?;
-    let original_size = src_meta.len();
+    let original_size = original.len() as u64;
     // A replaced original keeps its modified time, so it still sorts and
     // syncs like before.
     let modified = if dest == src {
@@ -987,8 +1002,11 @@ fn process_gif(
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
+    // A repaired source is written even if the result is not smaller than
+    // the original, which is broken; the repaired file itself is the
+    // fallback.
     let (output_size, kept_original) = match encoded {
-        Ok(bytes) if (bytes.len() as u64) < original_size => {
+        Ok(bytes) if bytes.len() < source.len() => {
             write_atomically(dest, &bytes, modified)?;
             (bytes.len() as u64, None)
         }
@@ -997,10 +1015,12 @@ fn process_gif(
                 Ok(_) => "re-encoded version was not smaller".to_string(),
                 Err(e) => format!("could not re-encode losslessly ({e:#})"),
             };
-            if dest != src {
+            if repair.is_some() {
+                write_atomically(dest, &source, modified)?;
+            } else if dest != src {
                 fs::copy(src, dest).with_context(|| format!("cannot write {}", dest.display()))?;
             }
-            (original_size, Some(reason))
+            (source.len() as u64, Some(reason))
         }
     };
 
@@ -1014,6 +1034,7 @@ fn process_gif(
         output_size,
         kept_original,
         used_gifsicle,
+        repair,
     };
 
     drop(store);
@@ -1475,6 +1496,51 @@ mod tests {
         let leftovers: Vec<_> = fs::read_dir(&root).unwrap().collect();
         assert_eq!(leftovers.len(), 1, "temporary files left behind");
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn truncated_gifs_are_repaired() {
+        let root = std::env::temp_dir().join("gif_optimizer_test_repair");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let src = root.join("cut.gif");
+        // Distinct frames, so dropping one cannot create a loop to fold.
+        write_gif(&src, &[1, 2, 3, 4, 5, 6, 7], Repeat::Infinite, false);
+        let full = fs::read(&src).unwrap();
+        let (complete, _) = playback(&src);
+
+        // Missing end marker: nothing is lost.
+        fs::write(&src, &full[..full.len() - 1]).unwrap();
+        let dest = root.join("out1.gif");
+        let r = process(&src, &dest, &root.join("work"), true).unwrap();
+        assert_eq!(r.repair, Some(repair::Repair::MissingTrailer));
+        assert_eq!(r.original_frames, 7);
+        assert_eq!(playback(&dest).0, complete);
+
+        // Cut inside the last frame: it is dropped, and the result is
+        // written even though it is not smaller than the broken original.
+        fs::write(&src, &full[..full.len() - 30]).unwrap();
+        let dest = root.join("out2.gif");
+        let r = process(&src, &dest, &root.join("work"), true).unwrap();
+        assert_eq!(r.repair, Some(repair::Repair::CutFrame(7)));
+        assert_eq!(r.original_frames, 6);
+        assert_eq!(playback(&dest).0, complete[..6]);
+        let text: Vec<String> = describe(&r, Instant::now())
+            .into_iter()
+            .map(|l| l.1)
+            .collect();
+        assert!(
+            text.iter()
+                .any(|l| l.contains("repaired: frame 7 was cut off")),
+            "{text:?}"
+        );
+
+        // Replacing repairs the original in place.
+        let r = process(&src, &src, &root.join("work"), true).unwrap();
+        assert!(r.repair.is_some());
+        assert_eq!(playback(&src).0, complete[..6]);
+        assert_eq!(repair::repair(&fs::read(&src).unwrap()).1, None);
         fs::remove_dir_all(&root).unwrap();
     }
 
