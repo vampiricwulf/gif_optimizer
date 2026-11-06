@@ -45,7 +45,7 @@ Without paths, the GIFs next to the executable are processed.
 | `--recursive`   | Also process GIFs in subfolders                                     |
 | `--force`       | Process GIFs again even if their result is up to date               |
 | `--no-gifsicle` | Do not try `gifsicle -O3` on the results                            |
-| `--jobs=N`      | Process N GIFs at a time (default: one per CPU core)                |
+| `--jobs=N`      | Process N GIFs at a time (default: 4)                               |
 | `--log`         | Append all output to `gif_optimizer.log` next to the executable     |
 | `--no-pause`    | Exit without waiting for Enter                                      |
 | `-h`, `--help`  | Show help                                                           |

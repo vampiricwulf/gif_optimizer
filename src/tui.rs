@@ -595,7 +595,8 @@ impl App {
             ),
             Item::Jobs => format!(
                 "How many GIFs to process at the same time. Use ←/→ or click -/+ to change. \
-                 Default: one per CPU core ({}).",
+                 Default: {}. More jobs use more memory and can slow down GIFs \
+                 with many frames.",
                 Options::default_jobs()
             ),
             Item::Run => format!("Optimize the GIFs in {}.", self.base_dir),

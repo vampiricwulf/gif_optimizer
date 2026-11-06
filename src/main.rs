@@ -9,7 +9,7 @@
 //! directly with the frame that replaces it. Pass `--exact` to merge only
 //! pixel-identical frames, making the result lossless.
 //!
-//! GIFs are processed in parallel (`--jobs=N`, default: one per CPU core).
+//! GIFs are processed in parallel (`--jobs=N`, default: 4).
 //! If `gifsicle` is on the PATH, its `-O3` pass is tried on each result and
 //! kept only if it is smaller and passes the same verification; disable it
 //! with `--no-gifsicle`.
@@ -77,7 +77,7 @@ Options:
   --recursive     Also process GIFs in subfolders
   --force         Process GIFs again even if their result is up to date
   --no-gifsicle   Do not try gifsicle -O3 on the results
-  --jobs=N        Process N GIFs at a time (default: one per CPU core)
+  --jobs=N        Process N GIFs at a time (default: 4)
   --log           Append all output to gif_optimizer.log next to the executable
   --no-pause      Exit without waiting for Enter
   -h, --help      Show this help
@@ -134,9 +134,16 @@ impl Default for Options {
     }
 }
 
+/// GIFs processed at the same time by default. Each one already uses a few
+/// threads and holds its frames in memory, so running one per core makes
+/// GIFs with hundreds of frames slow everything down.
+const DEFAULT_JOBS: usize = 4;
+
 impl Options {
+    /// `DEFAULT_JOBS`, or fewer on machines with fewer cores.
     fn default_jobs() -> usize {
-        std::thread::available_parallelism().map_or(1, |n| n.get())
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        DEFAULT_JOBS.min(cores)
     }
 
     /// Whether only pixel-identical frames may be merged. Replacing an
