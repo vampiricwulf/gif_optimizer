@@ -20,6 +20,8 @@
 //! smaller. Combine it with `--exact` to keep the replaced files lossless.
 //!
 //! `--log` appends everything shown to `<exe dir>/gif_optimizer.log`.
+//! Started without arguments in a terminal, an interactive screen lets you
+//! pick these options before running.
 
 mod composite;
 mod encode;
@@ -28,17 +30,18 @@ mod output;
 mod similar;
 mod store;
 mod timeline;
+mod tui;
 
 use std::fs::{self, File};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
 use composite::composite_frames;
-use output::{Output, Sink};
+use output::{Event, Output, Sink};
 use store::FrameStore;
 use timeline::{collapse_repeats, merge_consecutive, TimelineFrame};
 
@@ -61,6 +64,7 @@ struct Report {
     used_gifsicle: bool,
 }
 
+#[derive(Clone)]
 struct Options {
     exact: bool,
     gifsicle: bool,
@@ -100,6 +104,9 @@ impl Options {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() && io::stdin().is_terminal() && io::stdout().is_terminal() {
+        std::process::exit(tui::main());
+    }
     let has = |flag: &str| args.iter().any(|a| a == flag);
     let pause = !has("--no-pause");
     let jobs = args
@@ -122,7 +129,11 @@ fn main() {
             out.error(format!("Not logging: {e:#}"));
         }
     }
-    let code = if run_reported(&options, &out) { 0 } else { 1 };
+    let code = if run_reported(&options, &out, &AtomicBool::new(false)) {
+        0
+    } else {
+        1
+    };
     if pause {
         print!("\nPress Enter to exit...");
         let _ = io::stdout().flush();
@@ -147,8 +158,8 @@ fn open_log(out: &mut Output, options: &Options) -> Result<()> {
 }
 
 /// Runs and reports a fatal error. Returns true if everything succeeded.
-fn run_reported(options: &Options, out: &Output) -> bool {
-    match run(options, out) {
+fn run_reported(options: &Options, out: &Output, stop: &AtomicBool) -> bool {
+    match run(options, out, stop) {
         Ok(ok) => ok,
         Err(e) => {
             out.error(format!("Fatal error: {e:#}"));
@@ -157,15 +168,16 @@ fn run_reported(options: &Options, out: &Output) -> bool {
     }
 }
 
-/// Returns `Ok(true)` if every GIF was processed without errors.
-fn run(options: &Options, out: &Output) -> Result<bool> {
+/// Returns `Ok(true)` if every GIF was processed without errors. Once
+/// `stop` is set, no further GIFs are started.
+fn run(options: &Options, out: &Output, stop: &AtomicBool) -> Result<bool> {
     let base_dir = base_dir()?;
     let out_dir = base_dir.join(OUTPUT_DIR);
     let work_root = base_dir.join(WORK_DIR);
     let skip = [out_dir.clone(), work_root.clone()];
     out.line(format!("GIF Optimizer - {}", base_dir.display()));
     let gifs = find_gifs(&base_dir, options.recursive, &skip, out)?;
-
+    out.event(Event::Started { total: gifs.len() });
     if gifs.is_empty() {
         out.line("No GIF files found.");
         return Ok(true);
@@ -209,7 +221,7 @@ fn run(options: &Options, out: &Output) -> Result<bool> {
             .map(|_| {
                 s.spawn(|| {
                     let (mut errors, mut total_in, mut total_out) = (0usize, 0u64, 0u64);
-                    loop {
+                    while !stop.load(Ordering::Relaxed) {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(src) = gifs.get(i) else { break };
                         let work_dir = work_root.join(work_dir_name(i, src));
@@ -228,6 +240,9 @@ fn run(options: &Options, out: &Output) -> Result<bool> {
                                 total_in += r.original_size;
                                 total_out += r.output_size;
                                 out.line(format!("{header}\n{}", describe(&r, started)));
+                                out.event(Event::FileDone {
+                                    sizes: Some((r.original_size, r.output_size)),
+                                });
                             }
                             Err(e) => {
                                 errors += 1;
@@ -235,6 +250,7 @@ fn run(options: &Options, out: &Output) -> Result<bool> {
                                     "{header}\n    ERROR: {e:#}\n    temporary files kept in {}",
                                     work_dir.display()
                                 ));
+                                out.event(Event::FileDone { sizes: None });
                             }
                         }
                     }
@@ -249,6 +265,12 @@ fn run(options: &Options, out: &Output) -> Result<bool> {
     });
 
     out.line("");
+    let skipped = gifs.len().saturating_sub(next.load(Ordering::Relaxed));
+    if skipped > 0 {
+        out.line(format!(
+            "Stopped early; {skipped} GIF(s) were not processed."
+        ));
+    }
     if total_in > 0 {
         out.line(format!(
             "Total: {} -> {} (saved {})",

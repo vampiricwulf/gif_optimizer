@@ -7,6 +7,7 @@ description = "Losslessly removes redundant frames from GIFs in the executable's
 [dependencies]
 anyhow = "1"
 gif = "0.14"
+ratatui = "0.30.2"
 
 [dev-dependencies]
 weezl = "0.1"

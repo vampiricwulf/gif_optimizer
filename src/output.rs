@@ -1,14 +1,28 @@
-//! Where a run's messages go: the console, plus an optional log file that
-//! is appended to.
+//! Where a run's messages go: the console or the TUI, plus an optional
+//! log file that is appended to.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Progress of a run, as seen by the TUI.
+pub enum Event {
+    /// One or more lines of output.
+    Text { text: String, error: bool },
+    /// Processing is about to start on `total` files.
+    Started { total: usize },
+    /// A file finished, with its sizes if it succeeded.
+    FileDone { sizes: Option<(u64, u64)> },
+    /// The run is over; `ok` is false if anything failed.
+    Finished { ok: bool },
+}
+
 pub enum Sink {
     Console,
+    Channel(Sender<Event>),
 }
 
 pub struct Output {
@@ -46,6 +60,13 @@ impl Output {
         self.write(text.into(), true);
     }
 
+    /// Reports progress; only the TUI shows it.
+    pub fn event(&self, event: Event) {
+        if let Sink::Channel(tx) = &self.sink {
+            let _ = tx.send(event);
+        }
+    }
+
     fn write(&self, text: String, error: bool) {
         if let Some(log) = &self.log {
             let mut file = log.lock().unwrap_or_else(|e| e.into_inner());
@@ -54,6 +75,9 @@ impl Output {
         match &self.sink {
             Sink::Console if error => eprintln!("{text}"),
             Sink::Console => println!("{text}"),
+            Sink::Channel(tx) => {
+                let _ = tx.send(Event::Text { text, error });
+            }
         }
     }
 }
@@ -96,10 +120,12 @@ mod tests {
         let path = std::env::temp_dir().join("gif_optimizer_test_output.log");
         let _ = std::fs::remove_file(&path);
         for run in ["first", "second"] {
-            let mut out = Output::new(Sink::Console);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut out = Output::new(Sink::Channel(tx));
             out.open_log(&path, run).unwrap();
             out.line(format!("{run} line"));
             out.error(format!("{run} error"));
+            assert_eq!(rx.try_iter().count(), 2, "both lines reach the TUI");
         }
         let log = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = log.lines().collect();
