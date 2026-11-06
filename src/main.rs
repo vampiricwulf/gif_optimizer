@@ -18,10 +18,13 @@
 //! Original GIFs are never modified or deleted, unless `--replace` is given:
 //! then each original is overwritten in place, but only when the result is
 //! smaller. Combine it with `--exact` to keep the replaced files lossless.
+//!
+//! `--log` appends everything shown to `<exe dir>/gif_optimizer.log`.
 
 mod composite;
 mod encode;
 mod lzw;
+mod output;
 mod similar;
 mod store;
 mod timeline;
@@ -35,12 +38,13 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 
 use composite::composite_frames;
-
+use output::{Output, Sink};
 use store::FrameStore;
 use timeline::{collapse_repeats, merge_consecutive, TimelineFrame};
 
 const OUTPUT_DIR: &str = "gif_optimized";
 const WORK_DIR: &str = "gif_optimizing";
+const LOG_FILE: &str = "gif_optimizer.log";
 
 struct Report {
     original_frames: usize,
@@ -66,6 +70,32 @@ struct Options {
     replace: bool,
     /// Also process GIFs in subdirectories.
     recursive: bool,
+    /// Append all output to `LOG_FILE`.
+    log: bool,
+}
+
+impl Options {
+    fn default_jobs() -> usize {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    }
+
+    /// The command line that runs with these options, for the log header.
+    fn command(&self) -> String {
+        let mut cmd = "gif_optimizer".to_string();
+        for (on, flag) in [
+            (self.exact, "--exact"),
+            (!self.gifsicle, "--no-gifsicle"),
+            (self.replace, "--replace"),
+            (self.recursive, "--recursive"),
+            (self.log, "--log"),
+        ] {
+            if on {
+                cmd += " ";
+                cmd += flag;
+            }
+        }
+        cmd + &format!(" --jobs={}", self.jobs)
+    }
 }
 
 fn main() {
@@ -77,22 +107,22 @@ fn main() {
         .find_map(|a| a.strip_prefix("--jobs="))
         .and_then(|n| n.parse().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        .unwrap_or_else(Options::default_jobs);
     let options = Options {
         exact: has("--exact"),
         gifsicle: !has("--no-gifsicle"),
         jobs,
         replace: has("--replace"),
         recursive: has("--recursive"),
+        log: has("--log"),
     };
-    let code = match run(&options) {
-        Ok(true) => 0,
-        Ok(false) => 1,
-        Err(e) => {
-            eprintln!("Fatal error: {e:#}");
-            1
+    let mut out = Output::new(Sink::Console);
+    if options.log {
+        if let Err(e) = open_log(&mut out, &options) {
+            out.error(format!("Not logging: {e:#}"));
         }
-    };
+    }
+    let code = if run_reported(&options, &out) { 0 } else { 1 };
     if pause {
         print!("\nPress Enter to exit...");
         let _ = io::stdout().flush();
@@ -101,30 +131,53 @@ fn main() {
     std::process::exit(code);
 }
 
-/// Returns `Ok(true)` if every GIF was processed without errors.
-fn run(options: &Options) -> Result<bool> {
+/// The directory containing the executable, which is the one processed.
+fn base_dir() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("cannot locate the executable")?;
-    let base_dir = exe
+    Ok(exe
         .parent()
         .context("executable has no parent directory")?
-        .to_path_buf();
+        .to_path_buf())
+}
+
+fn open_log(out: &mut Output, options: &Options) -> Result<()> {
+    let path = base_dir()?.join(LOG_FILE);
+    out.open_log(&path, &options.command())
+        .with_context(|| format!("cannot open {}", path.display()))
+}
+
+/// Runs and reports a fatal error. Returns true if everything succeeded.
+fn run_reported(options: &Options, out: &Output) -> bool {
+    match run(options, out) {
+        Ok(ok) => ok,
+        Err(e) => {
+            out.error(format!("Fatal error: {e:#}"));
+            false
+        }
+    }
+}
+
+/// Returns `Ok(true)` if every GIF was processed without errors.
+fn run(options: &Options, out: &Output) -> Result<bool> {
+    let base_dir = base_dir()?;
     let out_dir = base_dir.join(OUTPUT_DIR);
     let work_root = base_dir.join(WORK_DIR);
     let skip = [out_dir.clone(), work_root.clone()];
-    println!("GIF Optimizer - {}", base_dir.display());
-    let gifs = find_gifs(&base_dir, options.recursive, &skip)?;
+    out.line(format!("GIF Optimizer - {}", base_dir.display()));
+    let gifs = find_gifs(&base_dir, options.recursive, &skip, out)?;
+
     if gifs.is_empty() {
-        println!("No GIF files found.");
+        out.line("No GIF files found.");
         return Ok(true);
     }
-    println!("Found {} GIF file(s).", gifs.len());
+    out.line(format!("Found {} GIF file(s).", gifs.len()));
     if options.replace {
-        println!("Originals will be replaced where the result is smaller.");
+        out.line("Originals will be replaced where the result is smaller.");
         if !options.exact {
-            println!("Look-alike frames may be merged; add --exact to keep them lossless.");
+            out.line("Look-alike frames may be merged; add --exact to keep them lossless.");
         }
     }
-    println!();
+    out.line("");
 
     if !options.replace {
         fs::create_dir_all(&out_dir)
@@ -136,7 +189,7 @@ fn run(options: &Options) -> Result<bool> {
     let gifsicle_version = options.gifsicle.then(gifsicle_version).flatten();
     let use_gifsicle = gifsicle_version.is_some();
     let jobs = options.jobs.min(gifs.len());
-    println!(
+    out.line(format!(
         "Processing {jobs} at a time; gifsicle {}.\n",
         match (options.gifsicle, &gifsicle_version) {
             (false, _) => "disabled".to_string(),
@@ -144,10 +197,10 @@ fn run(options: &Options) -> Result<bool> {
             // Output can differ between gifsicle versions, so name it.
             (true, Some(v)) => format!("found ({v}), used for extra compression"),
         }
-    );
+    ));
 
     // Workers take the next unprocessed GIF until none are left. Each GIF's
-    // report is printed in one piece when it finishes, so the order follows
+    // report is written in one piece when it finishes, so the order follows
     // completion rather than the file list.
     let next = AtomicUsize::new(0);
     let started_all = Instant::now();
@@ -174,14 +227,14 @@ fn run(options: &Options) -> Result<bool> {
                             Ok(r) => {
                                 total_in += r.original_size;
                                 total_out += r.output_size;
-                                println!("{header}\n{}", describe(&r, started));
+                                out.line(format!("{header}\n{}", describe(&r, started)));
                             }
                             Err(e) => {
                                 errors += 1;
-                                eprintln!(
+                                out.error(format!(
                                     "{header}\n    ERROR: {e:#}\n    temporary files kept in {}",
                                     work_dir.display()
-                                );
+                                ));
                             }
                         }
                     }
@@ -195,20 +248,23 @@ fn run(options: &Options) -> Result<bool> {
             .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
     });
 
-    println!();
+    out.line("");
     if total_in > 0 {
-        println!(
+        out.line(format!(
             "Total: {} -> {} (saved {})",
             format_size(total_in),
             format_size(total_out),
             format_size(total_in.saturating_sub(total_out))
-        );
+        ));
     }
-    println!("Finished in {:.1}s", started_all.elapsed().as_secs_f64());
+    out.line(format!(
+        "Finished in {:.1}s",
+        started_all.elapsed().as_secs_f64()
+    ));
     if options.replace {
-        println!("Smaller results replaced their originals.");
+        out.line("Smaller results replaced their originals.");
     } else {
-        println!("Optimized GIFs are in {}", out_dir.display());
+        out.line(format!("Optimized GIFs are in {}", out_dir.display()));
     }
 
     if errors == 0 {
@@ -216,10 +272,10 @@ fn run(options: &Options) -> Result<bool> {
             .with_context(|| format!("cannot remove {}", work_root.display()))?;
         Ok(true)
     } else {
-        eprintln!(
+        out.error(format!(
             "{errors} GIF(s) failed; {} was left in place.",
             work_root.display()
-        );
+        ));
         Ok(false)
     }
 }
@@ -288,14 +344,14 @@ fn gifsicle_version() -> Option<String> {
 
 /// GIFs in `dir`, and in its subdirectories (except `skip`) if `recursive`.
 /// Symlinked directories are not followed, so links cannot cause loops.
-fn find_gifs(dir: &Path, recursive: bool, skip: &[PathBuf]) -> Result<Vec<PathBuf>> {
+fn find_gifs(dir: &Path, recursive: bool, skip: &[PathBuf], out: &Output) -> Result<Vec<PathBuf>> {
     let mut gifs = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(current) = pending.pop() {
         let entries = match fs::read_dir(&current) {
             Ok(entries) => entries,
             Err(e) if current != dir => {
-                eprintln!("Skipping {}: {e}", current.display());
+                out.error(format!("Skipping {}: {e}", current.display()));
                 continue;
             }
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", dir.display())),
@@ -874,9 +930,10 @@ mod tests {
                 .collect()
         };
 
-        let flat = find_gifs(&root, false, std::slice::from_ref(&out_dir)).unwrap();
+        let out = Output::new(Sink::Console);
+        let flat = find_gifs(&root, false, std::slice::from_ref(&out_dir), &out).unwrap();
         assert_eq!(names(flat), ["top.gif"]);
-        let deep = find_gifs(&root, true, &[out_dir]).unwrap();
+        let deep = find_gifs(&root, true, &[out_dir], &out).unwrap();
         assert_eq!(names(deep), ["a/b/deep.gif", "a/mid.GIF", "top.gif"]);
 
         fs::remove_dir_all(&root).unwrap();

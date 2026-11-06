@@ -1,3 +1,4 @@
 /target
 *.gif
 /gif_optimizer.exe
+/gif_optimizer.log
