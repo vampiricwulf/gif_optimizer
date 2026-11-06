@@ -1,5 +1,6 @@
-//! Shrinks every GIF in the executable's directory by removing redundant
-//! frames and re-encoding only what changes between frames.
+//! Shrinks every GIF in the executable's directory (and its subdirectories
+//! with `--recursive`) by removing redundant frames and re-encoding only
+//! what changes between frames.
 //!
 //! By default, frames that differ only by dithering noise are treated as the
 //! same image (see `similar`), so the output looks identical but is not
@@ -12,9 +13,11 @@
 //! kept only if it is smaller and passes the same verification; disable it
 //! with `--no-gifsicle`.
 //!
-//! Output:  `<exe dir>/gif_optimized/<original name>.gif`
+//! Output:  `<exe dir>/gif_optimized/<relative path>.gif`
 //! Temp:    `<exe dir>/gif_optimizing/` (removed when everything succeeds)
-//! Original GIFs are never modified or deleted.
+//! Original GIFs are never modified or deleted, unless `--replace` is given:
+//! then each original is overwritten in place, but only when the result is
+//! smaller. Combine it with `--exact` to keep the replaced files lossless.
 
 mod composite;
 mod encode;
@@ -27,12 +30,12 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
 use composite::composite_frames;
+
 use store::FrameStore;
 use timeline::{collapse_repeats, merge_consecutive, TimelineFrame};
 
@@ -59,6 +62,10 @@ struct Options {
     gifsicle: bool,
     /// Number of GIFs processed at the same time.
     jobs: usize,
+    /// Overwrite the originals instead of writing to `OUTPUT_DIR`.
+    replace: bool,
+    /// Also process GIFs in subdirectories.
+    recursive: bool,
 }
 
 fn main() {
@@ -75,6 +82,8 @@ fn main() {
         exact: has("--exact"),
         gifsicle: !has("--no-gifsicle"),
         jobs,
+        replace: has("--replace"),
+        recursive: has("--recursive"),
     };
     let code = match run(&options) {
         Ok(true) => 0,
@@ -99,18 +108,28 @@ fn run(options: &Options) -> Result<bool> {
         .parent()
         .context("executable has no parent directory")?
         .to_path_buf();
-
-    let gifs = find_gifs(&base_dir)?;
+    let out_dir = base_dir.join(OUTPUT_DIR);
+    let work_root = base_dir.join(WORK_DIR);
+    let skip = [out_dir.clone(), work_root.clone()];
     println!("GIF Optimizer - {}", base_dir.display());
+    let gifs = find_gifs(&base_dir, options.recursive, &skip)?;
     if gifs.is_empty() {
         println!("No GIF files found.");
         return Ok(true);
     }
-    println!("Found {} GIF file(s).\n", gifs.len());
+    println!("Found {} GIF file(s).", gifs.len());
+    if options.replace {
+        println!("Originals will be replaced where the result is smaller.");
+        if !options.exact {
+            println!("Look-alike frames may be merged; add --exact to keep them lossless.");
+        }
+    }
+    println!();
 
-    let out_dir = base_dir.join(OUTPUT_DIR);
-    let work_root = base_dir.join(WORK_DIR);
-    fs::create_dir_all(&out_dir).with_context(|| format!("cannot create {}", out_dir.display()))?;
+    if !options.replace {
+        fs::create_dir_all(&out_dir)
+            .with_context(|| format!("cannot create {}", out_dir.display()))?;
+    }
     fs::create_dir_all(&work_root)
         .with_context(|| format!("cannot create {}", work_root.display()))?;
 
@@ -131,7 +150,6 @@ fn run(options: &Options) -> Result<bool> {
     // report is printed in one piece when it finishes, so the order follows
     // completion rather than the file list.
     let next = AtomicUsize::new(0);
-    let print_lock = Mutex::new(());
     let started_all = Instant::now();
     let (errors, total_in, total_out) = std::thread::scope(|s| {
         let workers: Vec<_> = (0..jobs)
@@ -142,12 +160,16 @@ fn run(options: &Options) -> Result<bool> {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(src) = gifs.get(i) else { break };
                         let work_dir = work_root.join(work_dir_name(i, src));
+                        let rel = src.strip_prefix(&base_dir).unwrap_or(src);
+                        let dest = if options.replace {
+                            src.clone()
+                        } else {
+                            out_dir.join(rel)
+                        };
                         let started = Instant::now();
                         let result =
-                            process_gif(src, &out_dir, &work_dir, options.exact, use_gifsicle);
-                        let name = src.file_name().unwrap_or_default().to_string_lossy();
-                        let header = format!("[{}/{}] {name}", i + 1, gifs.len());
-                        let _guard = print_lock.lock().unwrap_or_else(|e| e.into_inner());
+                            process_gif(src, &dest, &work_dir, options.exact, use_gifsicle);
+                        let header = format!("[{}/{}] {}", i + 1, gifs.len(), rel.display());
                         match result {
                             Ok(r) => {
                                 total_in += r.original_size;
@@ -156,8 +178,10 @@ fn run(options: &Options) -> Result<bool> {
                             }
                             Err(e) => {
                                 errors += 1;
-                                eprintln!("{header}\n    ERROR: {e:#}");
-                                eprintln!("    temporary files kept in {}", work_dir.display());
+                                eprintln!(
+                                    "{header}\n    ERROR: {e:#}\n    temporary files kept in {}",
+                                    work_dir.display()
+                                );
                             }
                         }
                     }
@@ -181,7 +205,11 @@ fn run(options: &Options) -> Result<bool> {
         );
     }
     println!("Finished in {:.1}s", started_all.elapsed().as_secs_f64());
-    println!("Optimized GIFs are in {}", out_dir.display());
+    if options.replace {
+        println!("Smaller results replaced their originals.");
+    } else {
+        println!("Optimized GIFs are in {}", out_dir.display());
+    }
 
     if errors == 0 {
         fs::remove_dir_all(&work_root)
@@ -258,17 +286,35 @@ fn gifsicle_version() -> Option<String> {
     )
 }
 
-fn find_gifs(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut gifs: Vec<PathBuf> = fs::read_dir(dir)
-        .with_context(|| format!("cannot read {}", dir.display()))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.extension()
+/// GIFs in `dir`, and in its subdirectories (except `skip`) if `recursive`.
+/// Symlinked directories are not followed, so links cannot cause loops.
+fn find_gifs(dir: &Path, recursive: bool, skip: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut gifs = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(e) if current != dir => {
+                eprintln!("Skipping {}: {e}", current.display());
+                continue;
+            }
+            Err(e) => return Err(e).with_context(|| format!("cannot read {}", dir.display())),
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                if recursive && !skip.contains(&path) {
+                    pending.push(path);
+                }
+            } else if path.is_file()
+                && path
+                    .extension()
                     .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("gif"))
-        })
-        .collect();
+            {
+                gifs.push(path);
+            }
+        }
+    }
     gifs.sort();
     Ok(gifs)
 }
@@ -346,9 +392,11 @@ fn gifsicle(bytes: &[u8], work_dir: &Path) -> Option<Vec<u8>> {
     result
 }
 
+/// Optimizes `src` and writes the result to `dest`, which may be `src`
+/// itself. If the result is not smaller, the original is copied to `dest`.
 fn process_gif(
     src: &Path,
-    out_dir: &Path,
+    dest: &Path,
     work_dir: &Path,
     exact: bool,
     use_gifsicle: bool,
@@ -419,14 +467,13 @@ fn process_gif(
     }
 
     let original_size = fs::metadata(src)?.len();
-    let dest = out_dir.join(src.file_name().context("source has no file name")?);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
     let (output_size, kept_original) = match encoded {
         Ok(bytes) if (bytes.len() as u64) < original_size => {
-            let temp_out = work_dir.join("output.gif");
-            fs::write(&temp_out, &bytes)
-                .with_context(|| format!("cannot write {}", temp_out.display()))?;
-            fs::copy(&temp_out, &dest)
-                .with_context(|| format!("cannot write {}", dest.display()))?;
+            write_atomically(dest, &bytes)?;
             (bytes.len() as u64, None)
         }
         other => {
@@ -434,7 +481,9 @@ fn process_gif(
                 Ok(_) => "re-encoded version was not smaller".to_string(),
                 Err(e) => format!("could not re-encode losslessly ({e:#})"),
             };
-            fs::copy(src, &dest).with_context(|| format!("cannot write {}", dest.display()))?;
+            if dest != src {
+                fs::copy(src, dest).with_context(|| format!("cannot write {}", dest.display()))?;
+            }
             (original_size, Some(reason))
         }
     };
@@ -455,6 +504,26 @@ fn process_gif(
     fs::remove_dir_all(work_dir)
         .with_context(|| format!("cannot remove {}", work_dir.display()))?;
     Ok(report)
+}
+
+/// Writes `bytes` to a temporary file next to `dest`, then renames it over
+/// `dest`, so `dest` is never left half-written (it may be an original).
+fn write_atomically(dest: &Path, bytes: &[u8]) -> Result<()> {
+    let mut temp_name = dest
+        .file_name()
+        .context("output has no file name")?
+        .to_owned();
+    temp_name.push(".optimizing");
+    let temp = dest.with_file_name(temp_name);
+    let result = fs::write(&temp, bytes)
+        .with_context(|| format!("cannot write {}", temp.display()))
+        .and_then(|()| {
+            fs::rename(&temp, dest).with_context(|| format!("cannot replace {}", dest.display()))
+        });
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 /// Maps every frame to its canonical image, then drops consecutive repeats
@@ -630,11 +699,11 @@ mod tests {
         write_gif(&src, seeds, repeat, transparent);
         let original = fs::read(&src).unwrap();
 
-        let report = process_gif(&src, &out_dir, &work_dir, false, false).unwrap();
+        let dest = out_dir.join(format!("{name}.gif"));
+        let report = process_gif(&src, &dest, &work_dir, false, false).unwrap();
 
         assert_eq!(fs::read(&src).unwrap(), original, "original was modified");
         assert!(!work_dir.exists(), "work dir not cleaned up");
-        let dest = out_dir.join(format!("{name}.gif"));
         assert!(dest.exists());
         assert!(fs::metadata(&dest).unwrap().len() <= original.len() as u64);
 
@@ -733,18 +802,19 @@ mod tests {
             .collect();
         write_frames(&src, frames, Repeat::Infinite, false);
 
-        let exact = process_gif(&src, &out_dir, &root.join("work_exact"), true, false).unwrap();
+        let dest = out_dir.join("dithered.gif");
+        let exact = process_gif(&src, &dest, &root.join("work_exact"), true, false).unwrap();
         assert_eq!(exact.unique_frames, 6, "dithered frames should all differ");
         assert_eq!(exact.cycles_folded, 1);
 
-        let r = process_gif(&src, &out_dir, &root.join("work"), false, false).unwrap();
+        let r = process_gif(&src, &dest, &root.join("work"), false, false).unwrap();
         assert_eq!(r.visual_unique_frames, 2);
         assert_eq!(r.output_frames, 2);
         assert_eq!(r.cycles_folded, 3);
         assert!(r.kept_original.is_none(), "{:?}", r.kept_original);
 
         let (src_frames, src_repeat) = playback(&src);
-        let (dest_frames, dest_repeat) = playback(&out_dir.join("dithered.gif"));
+        let (dest_frames, dest_repeat) = playback(&dest);
         assert_eq!(src_repeat, dest_repeat);
         assert_eq!(src_frames.len(), dest_frames.len() * 3);
         for (s, d) in src_frames.iter().zip(dest_frames.iter().cycle()) {
@@ -753,6 +823,61 @@ mod tests {
                 &s.0, &d.0, W as usize, H as usize
             ));
         }
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn replace_overwrites_original_in_place() {
+        let root = std::env::temp_dir().join("gif_optimizer_test_replace");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let src = root.join("replace.gif");
+        write_gif(&src, &[1, 1, 2, 2, 1, 1, 2, 2], Repeat::Infinite, false);
+        let original_size = fs::metadata(&src).unwrap().len();
+        let (before, _) = playback(&src);
+
+        let r = process_gif(&src, &src, &root.join("work"), true, false).unwrap();
+        assert!(r.kept_original.is_none(), "{:?}", r.kept_original);
+        assert!(fs::metadata(&src).unwrap().len() < original_size);
+        let (after, _) = playback(&src);
+        let unrolled: Vec<_> = (0..r.cycles_folded)
+            .flat_map(|_| after.iter().cloned())
+            .collect();
+        assert_eq!(unrolled, before);
+        let leftovers: Vec<_> = fs::read_dir(&root).unwrap().collect();
+        assert_eq!(leftovers.len(), 1, "temporary files left behind");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn find_gifs_recurses_only_when_asked() {
+        let root = std::env::temp_dir().join("gif_optimizer_test_find");
+        let _ = fs::remove_dir_all(&root);
+        let out_dir = root.join(OUTPUT_DIR);
+        for dir in [root.join("a/b"), out_dir.clone()] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        for file in ["top.gif", "a/mid.GIF", "a/b/deep.gif", "a/note.txt"] {
+            fs::write(root.join(file), b"").unwrap();
+        }
+        fs::write(out_dir.join("old.gif"), b"").unwrap();
+        let names = |gifs: Vec<PathBuf>| -> Vec<String> {
+            gifs.iter()
+                .map(|p| {
+                    p.strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect()
+        };
+
+        let flat = find_gifs(&root, false, std::slice::from_ref(&out_dir)).unwrap();
+        assert_eq!(names(flat), ["top.gif"]);
+        let deep = find_gifs(&root, true, &[out_dir]).unwrap();
+        assert_eq!(names(deep), ["a/b/deep.gif", "a/mid.GIF", "top.gif"]);
 
         fs::remove_dir_all(&root).unwrap();
     }
