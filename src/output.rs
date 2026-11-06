@@ -39,6 +39,8 @@ pub enum FileResult {
     Stopped,
     /// Skipped or cancelled because its folder was excluded.
     Excluded,
+    /// Skipped because the file is not a GIF.
+    NotGif,
     Failed,
 }
 

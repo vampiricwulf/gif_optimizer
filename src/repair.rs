@@ -1,10 +1,13 @@
-//! Repairs GIFs that end too early, as interrupted downloads and saves do.
+//! Repairs GIFs that end too early, as interrupted downloads and saves do,
+//! or that have junk after their last frame. Also recognizes files that are
+//! not GIFs at all, such as error pages saved under a `.gif` name.
 //!
 //! The file's blocks are walked without decoding any pixels. If it stops
-//! partway through, everything after the last complete frame is dropped,
-//! including a frame that was only partly written, and the end marker is
-//! added. Viewers disagree on how to show a partial frame, so it has no
-//! well-defined look to preserve.
+//! partway through, or something that is not a block follows a complete
+//! frame, everything after the last complete frame is dropped, including a
+//! frame that was only partly written, and the end marker is added. Viewers
+//! disagree on how to show a partial frame, so it has no well-defined look
+//! to preserve.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -21,6 +24,10 @@ pub enum Repair {
     CutFrame(usize),
     /// The file ends inside a block after the last frame, which was dropped.
     CutBlock,
+    /// Data that is not a GIF block followed frame `after`; that data and
+    /// everything after it (`bytes`, not counting a final end marker) was
+    /// dropped.
+    Junk { after: usize, bytes: usize },
 }
 
 impl fmt::Display for Repair {
@@ -29,8 +36,64 @@ impl fmt::Display for Repair {
             Repair::MissingTrailer => f.write_str("the end marker was missing; added it"),
             Repair::CutFrame(n) => write!(f, "frame {n} was cut off; dropped it"),
             Repair::CutBlock => f.write_str("the file ended inside a block; dropped it"),
+            Repair::Junk { after, bytes } => {
+                let unit = if *bytes == 1 { "byte" } else { "bytes" };
+                write!(
+                    f,
+                    "dropped {bytes} {unit} of unexpected data after frame {after}"
+                )
+            }
         }
     }
+}
+
+/// The error for a file that is not a GIF, saying what it is instead.
+#[derive(Debug)]
+pub struct NotGif(pub &'static str);
+
+impl fmt::Display for NotGif {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "not a GIF: {}", self.0)
+    }
+}
+
+impl std::error::Error for NotGif {}
+
+/// What `data` is, if it is clearly not a GIF. Anything starting like a
+/// GIF is left for the decoder to judge.
+pub fn not_gif(data: &[u8]) -> Option<NotGif> {
+    if data.starts_with(b"GIF") {
+        return None;
+    }
+    let starts = |magic: &[u8]| data.starts_with(magic);
+    let what = if data.is_empty() {
+        "the file is empty"
+    } else if looks_like_html(data) {
+        "it is a web page (probably a saved error page)"
+    } else if starts(b"\x89PNG") {
+        "it is a PNG image"
+    } else if starts(b"\xFF\xD8\xFF") {
+        "it is a JPEG image"
+    } else if starts(b"RIFF") && data.get(8..12) == Some(b"WEBP") {
+        "it is a WebP image"
+    } else if starts(b"\x1A\x45\xDF\xA3") {
+        "it is a WebM/MKV video"
+    } else if data.get(4..8) == Some(b"ftyp") {
+        "it is an MP4/MOV video"
+    } else {
+        "the data is not recognized"
+    };
+    Some(NotGif(what))
+}
+
+fn looks_like_html(data: &[u8]) -> bool {
+    let start = &data[..data.len().min(1024)];
+    let text = String::from_utf8_lossy(start).to_ascii_lowercase();
+    let text = text.trim_start_matches('\u{feff}').trim_start();
+    text.starts_with('<')
+        && ["<!doctype html", "<html", "<head", "<body"]
+            .iter()
+            .any(|tag| text.contains(tag))
 }
 
 /// `data` with any repair applied, and which one. Data that is complete,
@@ -93,7 +156,19 @@ fn find_cut(d: &[u8]) -> Option<(usize, Repair)> {
                     None => return (frames > 0).then_some((group, Repair::CutFrame(frames + 1))),
                 }
             }
-            // Not a block start: the file is damaged in some other way.
+            // Not a block start. After a complete frame, the rest cannot be
+            // read by the decoder either, so it is dropped.
+            _ if frames > 0 => {
+                // An end marker at the very end is kept, not dropped.
+                let bytes = d.len() - p - usize::from(d.ends_with(&[TRAILER]));
+                return Some((
+                    group,
+                    Repair::Junk {
+                        after: frames,
+                        bytes,
+                    },
+                ));
+            }
             _ => return None,
         }
     }
@@ -193,5 +268,73 @@ mod tests {
             "a cut just before the end marker keeps every frame"
         );
         assert_eq!(repair(&data[..5]).1, None, "too short to understand");
+    }
+
+    /// Start of each top-level block after the header, and the trailer.
+    fn block_starts(d: &[u8]) -> Vec<usize> {
+        let mut p = 13 + color_table_len(d[10]);
+        let mut starts = vec![p];
+        while d[p] != TRAILER {
+            p = match d[p] {
+                EXTENSION => skip_sub_blocks(d, p + 2).unwrap(),
+                _ => skip_sub_blocks(d, p + 10 + color_table_len(d[p + 9]) + 1).unwrap(),
+            };
+            starts.push(p);
+        }
+        starts
+    }
+
+    /// Junk between blocks, like a stray byte before the end marker, drops
+    /// everything from there but keeps the complete frames before it.
+    #[test]
+    fn junk_after_a_frame_is_dropped() {
+        let data = gif(3);
+        let trailer = data.len() - 1;
+        let mut stray = data.clone();
+        stray.insert(trailer, 0x01);
+        let (fixed, found) = repair(&stray);
+        assert_eq!(found, Some(Repair::Junk { after: 3, bytes: 1 }));
+        assert_eq!(&*fixed, &data[..]);
+        assert_eq!(
+            found.unwrap().to_string(),
+            "dropped 1 byte of unexpected data after frame 3"
+        );
+
+        // Any non-block byte, at any block boundary after the first frame.
+        let starts = block_starts(&data);
+        for &at in &starts {
+            for junk in (0..=255u8).filter(|b| ![EXTENSION, IMAGE, TRAILER].contains(b)) {
+                let mut bad = data.clone();
+                bad.insert(at, junk);
+                let (fixed, repair) = repair(&bad);
+                let kept = composite_frames(&*fixed, |_, _| Ok(()));
+                match repair {
+                    Some(Repair::Junk { after, .. }) => {
+                        assert_eq!(kept.unwrap().frame_count, after, "junk at {at}");
+                    }
+                    None => assert!(kept.is_err(), "junk at {at} before any frame"),
+                    other => panic!("junk at {at}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_gifs_are_recognized() {
+        let what = |data: &[u8]| not_gif(data).map(|n| n.to_string());
+        assert_eq!(what(&gif(1)), None);
+        assert_eq!(what(b"GIF8 broken"), None, "left for the decoder");
+        let page = b"\xEF\xBB\xBF\r\n<!DOCTYPE html>\r\n<html><title>Page not found</title>";
+        assert_eq!(
+            what(page).unwrap(),
+            "not a GIF: it is a web page (probably a saved error page)"
+        );
+        assert!(what(b"").unwrap().contains("empty"));
+        assert!(what(b"\x89PNG\r\n\x1a\n").unwrap().contains("PNG"));
+        assert!(what(b"\xFF\xD8\xFF\xE0").unwrap().contains("JPEG"));
+        assert!(what(b"RIFF\0\0\0\0WEBPVP8 ").unwrap().contains("WebP"));
+        assert!(what(b"\0\0\0\x20ftypisom").unwrap().contains("MP4"));
+        assert!(what(b"\x1A\x45\xDF\xA3").unwrap().contains("WebM"));
+        assert!(what(b"<svg>").unwrap().contains("not recognized"));
     }
 }

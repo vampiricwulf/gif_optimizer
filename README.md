@@ -19,11 +19,14 @@ decoded again and checked frame by frame before it is used.
   pass is tried on each result. It is kept only if it is smaller and passes
   the same verification.
 
-- **Repairs cut-off files.** GIFs that end too early, as interrupted
+- **Repairs damaged files.** GIFs that end too early, as interrupted
   downloads do, are repaired first: a missing end marker is added, and a
-  last frame that was only partly written is dropped. The report says what
-  was repaired, and the repaired result is written even if it is not
-  smaller.
+  last frame that was only partly written is dropped. Unexpected data after
+  a complete frame is dropped too. The report says what was repaired, and
+  the repaired result is written even if it is not smaller.
+- **Skips files that are not GIFs.** A `.gif` file that is really a saved
+  web page (such as a 404 error page), another image format or a video is
+  skipped and listed at the end of the run instead of counting as a failure.
 
 Otherwise, if a result is not smaller than the original, the original is
 kept.

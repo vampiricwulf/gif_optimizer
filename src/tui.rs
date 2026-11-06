@@ -147,6 +147,8 @@ struct RunView {
     stopped: usize,
     /// Files skipped or cancelled because their folder was excluded.
     excluded: usize,
+    /// Files skipped because they are not GIFs; counted in `done` too.
+    not_gifs: usize,
     /// Files in progress, by index.
     active: Vec<Active>,
     /// The selected file in progress, by index.
@@ -681,6 +683,7 @@ impl RunView {
             failed: 0,
             stopped: 0,
             excluded: 0,
+            not_gifs: 0,
             active: Vec::new(),
             selected: None,
             confirm: None,
@@ -750,6 +753,10 @@ impl RunView {
                         }
                         FileResult::Stopped => self.stopped += 1,
                         FileResult::Excluded => self.excluded += 1,
+                        FileResult::NotGif => {
+                            self.done += 1;
+                            self.not_gifs += 1;
+                        }
                     }
                 }
                 Ok(Event::Finished { ok }) => {
@@ -899,6 +906,9 @@ impl RunView {
         }
         if self.excluded > 0 {
             label += &format!(", {} skipped", self.excluded);
+        }
+        if self.not_gifs > 0 {
+            label += &format!(", {} not GIFs", self.not_gifs);
         }
         let (title, style) = match self.finished {
             None => (" Running ", Style::new().cyan()),

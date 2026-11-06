@@ -301,6 +301,8 @@ struct Tally {
     errors: usize,
     stopped: usize,
     excluded: usize,
+    /// Names of files that turned out not to be GIFs.
+    not_gifs: Vec<String>,
     bytes_in: u64,
     bytes_out: u64,
 }
@@ -311,6 +313,7 @@ impl Tally {
             errors: self.errors + o.errors,
             stopped: self.stopped + o.stopped,
             excluded: self.excluded + o.excluded,
+            not_gifs: [self.not_gifs, o.not_gifs].concat(),
             bytes_in: self.bytes_in + o.bytes_in,
             bytes_out: self.bytes_out + o.bytes_out,
         }
@@ -556,6 +559,14 @@ fn run(options: &Options, out: &Output, control: &Control) -> Result<bool> {
                                 out.block(vec![header, (Kind::Warning, format!("    {note}"))]);
                                 result
                             }
+                            Err(e) if e.downcast_ref::<repair::NotGif>().is_some() => {
+                                t.not_gifs.push(job.name.clone());
+                                out.block(vec![
+                                    header,
+                                    (Kind::Warning, format!("    skipped: {e}")),
+                                ]);
+                                FileResult::NotGif
+                            }
                             Err(e) => {
                                 t.errors += 1;
                                 out.block(vec![
@@ -590,11 +601,25 @@ fn run(options: &Options, out: &Output, control: &Control) -> Result<bool> {
         errors,
         stopped,
         excluded,
+        mut not_gifs,
         bytes_in: total_in,
         bytes_out: total_out,
     } = tally;
 
     out.line("");
+    if !not_gifs.is_empty() {
+        not_gifs.sort();
+        let mut lines = vec![(
+            Kind::Warning,
+            format!("Skipped {} file(s) that are not GIFs:", not_gifs.len()),
+        )];
+        lines.extend(
+            not_gifs
+                .into_iter()
+                .map(|n| (Kind::Warning, format!("    {n}"))),
+        );
+        out.block(lines);
+    }
     if excluded > 0 {
         out.say(
             Kind::Warning,
@@ -870,16 +895,18 @@ fn process_gif(
     progress: &Progress,
 ) -> Result<Report> {
     progress.stage(Stage::Reading)?;
+    let original = fs::read(src).with_context(|| format!("cannot read {}", src.display()))?;
+    if let Some(not_gif) = repair::not_gif(&original) {
+        return Err(not_gif.into());
+    }
     if work_dir.exists() {
         fs::remove_dir_all(work_dir)?;
     }
     let mut store = FrameStore::new(&work_dir.join("frames"))?;
 
     // 1. Break the GIF into fully composited still frames, storing each
-    //    distinct image only once.
-    //    A file that ends too early is repaired first.
+    //    distinct image only once. A damaged file is repaired first.
     let mut raw = Vec::new();
-    let original = fs::read(src).with_context(|| format!("cannot read {}", src.display()))?;
     let (source, repair) = repair::repair(&original);
     let info = composite_frames(&*source, |canvas, delay| {
         progress.tick()?;
@@ -1224,6 +1251,15 @@ mod tests {
 
     static NEVER: Control = Control::new();
 
+    /// `run` uses one work folder next to the test executable and deletes
+    /// it when done, so tests that call it must not overlap.
+    static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn run_alone(options: &Options, out: &Output, control: &Control) -> Result<bool> {
+        let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        run(options, out, control)
+    }
+
     fn process(src: &Path, dest: &Path, work_dir: &Path, exact: bool) -> Result<Report> {
         process_gif(
             src,
@@ -1545,6 +1581,62 @@ mod tests {
     }
 
     #[test]
+    fn junk_and_non_gifs_do_not_fail_a_run() {
+        let root = std::env::temp_dir().join("gif_optimizer_test_junk");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        write_gif(&root.join("good.gif"), &[1, 2], Repeat::Infinite, false);
+        let junk = root.join("junk.gif");
+        write_gif(&junk, &[1, 2, 3], Repeat::Infinite, false);
+        let (frames, _) = playback(&junk);
+        let mut data = fs::read(&junk).unwrap();
+        data.insert(data.len() - 1, 0x01);
+        fs::write(&junk, data).unwrap();
+        fs::write(
+            root.join("page.gif"),
+            "<!DOCTYPE html>\n<html><title>Page not found</title></html>",
+        )
+        .unwrap();
+
+        let options = Options {
+            gifsicle: false,
+            paths: vec![root.clone()],
+            ..Options::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ok = run_alone(&options, &Output::new(Sink::Channel(tx)), &Control::new()).unwrap();
+        let mut text = Vec::new();
+        let mut not_gifs = 0;
+        for e in rx.try_iter() {
+            match e {
+                Event::Text(lines) => text.extend(lines.into_iter().map(|l| l.1)),
+                Event::FileDone {
+                    result: FileResult::NotGif,
+                    ..
+                } => not_gifs += 1,
+                _ => {}
+            }
+        }
+        let text = text.join("\n");
+        assert!(ok, "{text}");
+        assert_eq!(not_gifs, 1);
+        assert!(
+            text.contains("skipped: not a GIF: it is a web page"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Skipped 1 file(s) that are not GIFs:"),
+            "{text}"
+        );
+        assert!(text.contains("repaired: dropped 1 byte of unexpected data after frame 3"));
+        let out_dir = root.join(OUTPUT_DIR);
+        assert_eq!(playback(&out_dir.join("junk.gif")).0, frames);
+        assert!(out_dir.join("good.gif").exists());
+        assert!(!out_dir.join("page.gif").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn excluded_folders_are_skipped() {
         let root = std::env::temp_dir().join("gif_optimizer_test_exclude");
         let _ = fs::remove_dir_all(&root);
@@ -1562,7 +1654,7 @@ mod tests {
         let control = Control::new();
         control.exclude(root.join("skip"));
         let (tx, rx) = std::sync::mpsc::channel();
-        let ok = run(&options, &Output::new(Sink::Channel(tx)), &control).unwrap();
+        let ok = run_alone(&options, &Output::new(Sink::Channel(tx)), &control).unwrap();
         assert!(ok, "skipping is not a failure");
         let out_dir = root.join(OUTPUT_DIR);
         assert!(out_dir.join("top.gif").exists());
