@@ -17,7 +17,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Gauge, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::output::{Event, Output, Sink};
+use crate::output::{Event, FileResult, Kind, Output, Sink};
+use crate::progress::Stage;
 use crate::{format_size, Options, LOG_FILE, OUTPUT_DIR, WORK_DIR};
 
 const MAX_JOBS: usize = 64;
@@ -29,16 +30,18 @@ enum Item {
     Recursive,
     Gifsicle,
     Log,
+    Force,
     Jobs,
     Run,
 }
 
-const ITEMS: [Item; 7] = [
+const ITEMS: [Item; 8] = [
     Item::Exact,
     Item::Replace,
     Item::Recursive,
     Item::Gifsicle,
     Item::Log,
+    Item::Force,
     Item::Jobs,
     Item::Run,
 ];
@@ -78,14 +81,57 @@ impl Drop for MouseCapture {
     }
 }
 
+/// A file being processed.
+struct Active {
+    index: usize,
+    name: String,
+    stage: Stage,
+    done: usize,
+    total: usize,
+}
+
+impl Active {
+    /// Rough fraction of the file's work that is done. Reading is quick
+    /// compared to optimizing, and gifsicle is only a final touch.
+    fn fraction(&self) -> f64 {
+        let part = if self.total == 0 {
+            0.0
+        } else {
+            (self.done as f64 / self.total as f64).min(1.0)
+        };
+        match self.stage {
+            Stage::Reading => 0.0,
+            Stage::Optimizing => 0.9 * part,
+            Stage::Gifsicle => 0.9 + 0.1 * part,
+        }
+    }
+
+    fn label(&self) -> String {
+        match (self.stage, self.total) {
+            (Stage::Reading, _) => format!("reading, {} frames", self.done),
+            (stage, 0) => stage.label().to_string(),
+            (stage, total) => format!(
+                "{} {:>3}%",
+                stage.label(),
+                (self.done * 100 / total).min(100)
+            ),
+        }
+    }
+}
+
 /// A run in progress or just finished.
 struct RunView {
     rx: Receiver<Event>,
     stop: Arc<AtomicBool>,
-    lines: Vec<(String, bool)>,
+    lines: Vec<(Kind, String)>,
     total: Option<usize>,
+    /// Files that finished, successfully or not.
     done: usize,
     failed: usize,
+    /// Files cancelled by a stop request.
+    stopped: usize,
+    /// Files in progress, by index.
+    active: Vec<Active>,
     bytes_in: u64,
     bytes_out: u64,
     /// `Some(ok)` once the run is over.
@@ -126,13 +172,11 @@ pub fn main() -> i32 {
 impl App {
     fn new() -> Self {
         Self {
+            // Exact is on whenever Replace is turned on, so turning it off
+            // again is an explicit choice to allow look-alike merging.
             options: Options {
-                exact: false,
-                gifsicle: true,
-                jobs: Options::default_jobs(),
-                replace: false,
-                recursive: false,
-                log: false,
+                lossy: true,
+                ..Options::default()
             },
             selected: RUN,
             confirming: false,
@@ -215,6 +259,9 @@ impl App {
                 if let Some(flag) = self.flag(item) {
                     *flag = !*flag;
                 }
+                if item == Item::Replace && self.options.replace {
+                    self.options.exact = true;
+                }
             }
             _ => {}
         }
@@ -258,6 +305,7 @@ impl App {
             Item::Recursive => &mut o.recursive,
             Item::Gifsicle => &mut o.gifsicle,
             Item::Log => &mut o.log,
+            Item::Force => &mut o.force,
             Item::Jobs | Item::Run => return None,
         })
     }
@@ -302,12 +350,9 @@ impl App {
                 run.draw(frame, body);
                 match run.finished {
                     None if run.stop.load(Ordering::Relaxed) => {
-                        vec![Hint::Note("Stopping after the GIFs in progress..."), SCROLL]
+                        vec![Hint::Note("Stopping..."), SCROLL]
                     }
-                    None => vec![
-                        Hint::Key("q", "stop after the GIFs in progress", None, q),
-                        SCROLL,
-                    ],
+                    None => vec![Hint::Key("q", "stop", None, q), SCROLL],
                     Some(_) => vec![
                         Hint::Key("Enter", "back to options", None, Some(KeyCode::Enter)),
                         Hint::Key("q", "quit", None, q),
@@ -384,6 +429,7 @@ impl App {
             Item::Recursive => toggle(o.recursive, "Include subfolders".into()),
             Item::Gifsicle => toggle(o.gifsicle, "Use gifsicle".into()),
             Item::Log => toggle(o.log, format!("Write {LOG_FILE}")),
+            Item::Force => toggle(o.force, "Redo up-to-date GIFs".into()),
             // The spans at index 1 and 3 are the -/+ buttons; see `draw_settings`.
             Item::Jobs => vec![
                 Span::from("    Parallel jobs: "),
@@ -524,12 +570,13 @@ impl App {
                  the result looks the same but is not pixel-identical."
                 .to_string(),
             Item::Replace => format!(
-                "Overwrite each original in place, only when the result is smaller. \
-                 This cannot be undone{}. When off, results are written to {OUTPUT_DIR}/.",
+                "Overwrite each original in place, only when the result is smaller, \
+                 keeping its modified time. This cannot be undone{}. \
+                 When off, results are written to {OUTPUT_DIR}/.",
                 if self.options.exact {
                     ""
                 } else {
-                    "; turn on Exact to keep the replaced files lossless"
+                    ", and Exact is off, so look-alike frames may be merged"
                 }
             ),
             Item::Recursive => format!(
@@ -541,6 +588,10 @@ impl App {
                 .to_string(),
             Item::Log => format!(
                 "Append everything shown during the run to {LOG_FILE} next to the executable."
+            ),
+            Item::Force => format!(
+                "Process every GIF again. When off, a GIF is skipped if {OUTPUT_DIR}/ already \
+                 has a result that is newer than the GIF."
             ),
             Item::Jobs => format!(
                 "How many GIFs to process at the same time. Use ←/→ or click -/+ to change. \
@@ -561,6 +612,8 @@ impl RunView {
             total: None,
             done: 0,
             failed: 0,
+            stopped: 0,
+            active: Vec::new(),
             bytes_in: 0,
             bytes_out: 0,
             finished: None,
@@ -572,22 +625,52 @@ impl RunView {
     fn receive(&mut self) {
         loop {
             match self.rx.try_recv() {
-                Ok(Event::Text { text, error }) => {
-                    self.lines
-                        .extend(text.lines().map(|l| (l.to_string(), error)));
-                    if text.is_empty() {
-                        self.lines.push((String::new(), error));
+                Ok(Event::Text(lines)) => {
+                    for (kind, text) in lines {
+                        self.lines
+                            .extend(text.lines().map(|l| (kind, l.to_string())));
+                        if text.is_empty() {
+                            self.lines.push((kind, String::new()));
+                        }
                     }
                 }
                 Ok(Event::Started { total }) => self.total = Some(total),
-                Ok(Event::FileDone { sizes }) => {
-                    self.done += 1;
-                    match sizes {
-                        Some((a, b)) => {
+                Ok(Event::FileStarted { index, name }) => {
+                    let at = self.active.partition_point(|a| a.index < index);
+                    self.active.insert(
+                        at,
+                        Active {
+                            index,
+                            name,
+                            stage: Stage::Reading,
+                            done: 0,
+                            total: 0,
+                        },
+                    );
+                }
+                Ok(Event::Progress {
+                    index,
+                    stage,
+                    done,
+                    total,
+                }) => {
+                    if let Some(a) = self.active.iter_mut().find(|a| a.index == index) {
+                        (a.stage, a.done, a.total) = (stage, done, total);
+                    }
+                }
+                Ok(Event::FileDone { index, result }) => {
+                    self.active.retain(|a| a.index != index);
+                    match result {
+                        FileResult::Done(a, b) => {
+                            self.done += 1;
                             self.bytes_in += a;
                             self.bytes_out += b;
                         }
-                        None => self.failed += 1,
+                        FileResult::Failed => {
+                            self.done += 1;
+                            self.failed += 1;
+                        }
+                        FileResult::Stopped => self.stopped += 1,
                     }
                 }
                 Ok(Event::Finished { ok }) => self.finished = Some(ok),
@@ -595,13 +678,27 @@ impl RunView {
                 Err(TryRecvError::Disconnected) => {
                     if self.finished.is_none() {
                         self.lines
-                            .push(("The run ended unexpectedly.".to_string(), true));
+                            .push((Kind::Error, "The run ended unexpectedly.".to_string()));
                         self.finished = Some(false);
                     }
+                    self.active.clear();
                     break;
                 }
             }
         }
+    }
+
+    /// Fraction of the run that is done, counting files in progress partly.
+    fn ratio(&self) -> f64 {
+        let ratio = match self.total {
+            None => 0.0,
+            Some(0) => 1.0,
+            Some(total) => {
+                let partial: f64 = self.active.iter().map(Active::fraction).sum();
+                (self.done as f64 + partial) / total as f64
+            }
+        };
+        ratio.clamp(0.0, 1.0)
     }
 
     fn max_scroll(&self) -> usize {
@@ -631,8 +728,14 @@ impl RunView {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let [gauge, log] =
-            Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+        let shown = self.active.len().min(area.height as usize / 3);
+        let active_height = if shown == 0 { 0 } else { shown as u16 + 2 };
+        let [gauge, active, log] = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(active_height),
+            Constraint::Min(0),
+        ])
+        .areas(area);
 
         let mut label = match self.total {
             None => "Looking for GIFs...".to_string(),
@@ -649,24 +752,46 @@ impl RunView {
         if self.failed > 0 {
             label += &format!(", {} failed", self.failed);
         }
+        if self.stopped > 0 {
+            label += &format!(", {} stopped", self.stopped);
+        }
         let (title, style) = match self.finished {
             None => (" Running ", Style::new().cyan()),
             Some(true) => (" Done ", Style::new().green()),
             Some(false) => (" Finished with errors ", Style::new().red()),
         };
-        let ratio = match self.total {
-            None => 0.0,
-            Some(0) => 1.0,
-            Some(total) => self.done as f64 / total as f64,
-        };
         frame.render_widget(
             Gauge::default()
                 .block(Block::bordered().title(title.bold()).border_style(style))
                 .gauge_style(style)
-                .ratio(ratio.clamp(0.0, 1.0))
+                .ratio(self.ratio())
                 .label(label),
             gauge,
         );
+
+        if shown > 0 {
+            const BAR: usize = 20;
+            let lines: Vec<Line> = self.active[..shown]
+                .iter()
+                .map(|a| {
+                    let filled = (a.fraction() * BAR as f64).round() as usize;
+                    Line::from(vec![
+                        Span::from("█".repeat(filled)).cyan(),
+                        Span::from("░".repeat(BAR - filled)).dark_gray(),
+                        Span::from(format!(" {:<18} ", a.label())).dim(),
+                        Span::from(a.name.clone()),
+                    ])
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::bordered()
+                        .title(" In progress ")
+                        .border_style(Style::new().dark_gray()),
+                ),
+                active,
+            );
+        }
 
         let block = Block::bordered()
             .title(" Output ")
@@ -678,39 +803,24 @@ impl RunView {
             .iter()
             .skip(top)
             .take(self.log_height)
-            .map(|(text, error)| Line::styled(text.as_str(), log_style(text, *error)))
+            .map(|(kind, text)| Line::styled(text.as_str(), log_style(*kind)))
             .collect();
         frame.render_widget(Paragraph::new(lines).block(block), log);
     }
 }
 
-/// Colors a line of run output by what it reports. This matches the
-/// messages written by `run` and `describe` in `main.rs`.
-fn log_style(text: &str, error: bool) -> Style {
+/// Colors a line of run output by what it reports.
+fn log_style(kind: Kind) -> Style {
     let style = Style::new();
-    if error {
-        return style.red();
-    }
-    if text.starts_with('[') {
-        return style.cyan().bold();
-    }
-    let t = text.trim_start();
-    if t.starts_with("kept original")
-        || t.starts_with("Stopped early")
-        || t.starts_with("Look-alike")
-        || t.starts_with("Originals will be replaced")
-    {
-        style.yellow()
-    } else if t.starts_with("size:") {
-        style.green()
-    } else if t.starts_with("Total:") {
-        style.green().bold()
-    } else if t.starts_with("Finished in") || t.starts_with("Found ") {
-        style.bold()
-    } else if t.starts_with("done in") || t.starts_with("frames:") {
-        style.dim()
-    } else {
-        style
+    match kind {
+        Kind::Plain => style,
+        Kind::Heading => style.cyan().bold(),
+        Kind::Detail => style.dim(),
+        Kind::Good => style.green(),
+        Kind::Warning => style.yellow(),
+        Kind::Error => style.red(),
+        Kind::Emphasis => style.bold(),
+        Kind::Total => style.green().bold(),
     }
 }
 
@@ -744,6 +854,11 @@ mod tests {
         app.selected = 1;
         app.on_key(KeyCode::Char(' '));
         assert!(app.options.replace);
+        assert!(app.options.exact, "replacing turns on Exact");
+        assert!(app.options.lossless());
+        app.selected = 0;
+        app.on_key(KeyCode::Char(' '));
+        assert!(!app.options.lossless(), "Exact can be turned off again");
         assert!(render(&mut app, 80, 24).contains("[x] Replace originals"));
 
         app.selected = ITEMS.len() - 1;
@@ -754,7 +869,7 @@ mod tests {
         app.on_key(KeyCode::Char('n'));
         assert!(!app.confirming && app.run.is_none());
 
-        app.selected = 5;
+        app.selected = 6;
         app.on_key(KeyCode::Left);
         for _ in 0..MAX_JOBS {
             app.on_key(KeyCode::Left);
@@ -768,23 +883,60 @@ mod tests {
         let mut app = App::new();
         app.run = Some(RunView::new(rx, Arc::new(AtomicBool::new(false))));
         let out = Output::new(Sink::Channel(tx));
-        out.event(Event::Started { total: 2 });
+        out.event(Event::Started { total: 3 });
         for i in 0..50 {
             out.line(format!("line {i}\n  detail"));
         }
-        out.event(Event::FileDone {
-            sizes: Some((2048, 1024)),
+        for index in 0..3 {
+            out.event(Event::FileStarted {
+                index,
+                name: format!("file{index}.gif"),
+            });
+        }
+        out.event(Event::Progress {
+            index: 1,
+            stage: Stage::Optimizing,
+            done: 50,
+            total: 100,
         });
-        out.event(Event::FileDone { sizes: None });
+        out.event(Event::FileDone {
+            index: 0,
+            result: FileResult::Done(2048, 1024),
+        });
+        let run = app.run.as_mut().unwrap();
+        run.receive();
+        let screen = render(&mut app, 80, 24);
+        assert!(screen.contains("optimizing  50%") && screen.contains("file1.gif"));
+        assert!(
+            !screen.contains("file0.gif"),
+            "finished files leave the list"
+        );
+        // One file done plus 45% of another, out of three.
+        let ratio = app.run.as_ref().unwrap().ratio();
+        assert!((ratio - 1.45 / 3.0).abs() < 1e-9, "{ratio}");
+
+        out.event(Event::FileDone {
+            index: 1,
+            result: FileResult::Failed,
+        });
+        out.event(Event::FileDone {
+            index: 2,
+            result: FileResult::Stopped,
+        });
         drop(out);
         let run = app.run.as_mut().unwrap();
         run.receive();
         assert_eq!(run.finished, Some(false), "a lost worker counts as failed");
         assert_eq!(run.lines.len(), 101);
-        assert_eq!(run.lines[100], ("The run ended unexpectedly.".into(), true));
+        assert_eq!(
+            run.lines[100],
+            (Kind::Error, "The run ended unexpectedly.".into())
+        );
+        assert!(run.active.is_empty());
 
         let screen = render(&mut app, 80, 24);
-        assert!(screen.contains("2/2 GIFs") && screen.contains("1 failed"));
+        assert!(screen.contains("2/3 GIFs") && screen.contains("1 failed"));
+        assert!(screen.contains("1 stopped") && !screen.contains("In progress"));
         assert!(screen.contains("line 49"), "follows the end");
         app.on_key(KeyCode::Home);
         assert!(render(&mut app, 80, 24).contains("line 0 "));
@@ -826,7 +978,7 @@ mod tests {
 
         let minus = find(&mut app, "[-]");
         click(&mut app, minus);
-        assert_eq!((app.options.jobs, app.selected), (3, 5));
+        assert_eq!((app.options.jobs, app.selected), (3, 6));
         let plus = find(&mut app, "[+]");
         click(&mut app, plus);
         click(&mut app, plus);
@@ -901,15 +1053,29 @@ mod tests {
     }
 
     #[test]
-    fn log_lines_are_colored_by_meaning() {
-        let fg = |text, error| log_style(text, error).fg;
-        assert_eq!(fg("[1/2] a.gif", false), Some(Color::Cyan));
-        assert_eq!(fg("    size:   1 KB -> 0 KB", false), Some(Color::Green));
+    fn log_lines_are_colored_by_kind() {
+        let (tx, rx) = mpsc::channel();
+        let mut run = RunView::new(rx, Arc::new(AtomicBool::new(false)));
+        let out = Output::new(Sink::Channel(tx));
+        out.block(vec![
+            (Kind::Heading, "[1/2] a.gif".into()),
+            (Kind::Good, "    size: 1 KB -> 0 KB".into()),
+            (Kind::Warning, "    kept original file: bigger".into()),
+        ]);
+        out.error("broken\nstill broken");
+        out.line("GIF Optimizer - x");
+        run.receive();
+        let colors: Vec<_> = run.lines.iter().map(|(k, _)| log_style(*k).fg).collect();
         assert_eq!(
-            fg("    kept original file: bigger", false),
-            Some(Color::Yellow)
+            colors,
+            [
+                Some(Color::Cyan),
+                Some(Color::Green),
+                Some(Color::Yellow),
+                Some(Color::Red),
+                Some(Color::Red),
+                None
+            ]
         );
-        assert_eq!(fg("anything", true), Some(Color::Red));
-        assert_eq!(fg("GIF Optimizer - x", false), None);
     }
 }

@@ -14,6 +14,7 @@ use gif::{DisposalMethod, Encoder, Frame, Repeat};
 
 use crate::composite::{composite_frames, rgb, Pixel, TRANSPARENT};
 use crate::lzw::{self, Choice};
+use crate::progress::Progress;
 use crate::store::FrameStore;
 use crate::timeline::TimelineFrame;
 
@@ -118,12 +119,14 @@ fn clear_rect(canvas: &mut [Pixel], canvas_w: usize, rect: Rect) {
     }
 }
 
-/// Decides rectangle, disposal method and palette mode for every output frame.
+/// Decides rectangle, disposal method and palette mode for every output
+/// frame. Ticks `progress` once per frame.
 pub fn plan_frames(
     store: &FrameStore,
     timeline: &[TimelineFrame],
     width: u16,
     height: u16,
+    progress: &Progress,
 ) -> Result<Vec<FramePlan>> {
     let (w, h) = (width as usize, height as usize);
     let mut plans = Vec::with_capacity(timeline.len());
@@ -133,6 +136,7 @@ pub fn plan_frames(
     let mut current = store.load(timeline[0].id)?;
 
     for k in 0..timeline.len() {
+        progress.tick()?;
         let next = match timeline.get(k + 1) {
             Some(f) => Some(store.load(f.id)?),
             None => None,
@@ -235,6 +239,8 @@ pub fn global_palette(plans: &[FramePlan]) -> Option<GlobalPalette> {
     })
 }
 
+/// Writes the planned frames. Ticks `progress` once per frame.
+#[allow(clippy::too_many_arguments)]
 pub fn encode(
     store: &FrameStore,
     timeline: &[TimelineFrame],
@@ -243,6 +249,7 @@ pub fn encode(
     height: u16,
     repeat: Repeat,
     global: Option<&GlobalPalette>,
+    progress: &Progress,
 ) -> Result<Vec<u8>> {
     let w = width as usize;
     let mut encoder = Encoder::new(
@@ -256,6 +263,7 @@ pub fn encode(
     let mut base = vec![TRANSPARENT; w * height as usize];
 
     for (k, (tf, plan)) in timeline.iter().zip(plans).enumerate() {
+        progress.tick()?;
         let current = store.load(tf.id)?;
         let syms = symbols(&current, &base, w, plan.rect, plan.mode);
 
@@ -323,6 +331,7 @@ pub fn encode(
 /// pixel for pixel, including delays and loop count. The timeline refers to
 /// stored frames, so after look-alike grouping each frame is checked against
 /// its group's representative rather than the original frame it replaced.
+/// Ticks `progress` once per decoded frame.
 pub fn verify(
     encoded: &[u8],
     store: &FrameStore,
@@ -330,9 +339,11 @@ pub fn verify(
     width: u16,
     height: u16,
     repeat: Repeat,
+    progress: &Progress,
 ) -> Result<()> {
     let mut idx = 0;
     let info = composite_frames(encoded, |canvas, delay| {
+        progress.tick()?;
         let Some(expected) = timeline.get(idx) else {
             bail!("output has more frames than expected");
         };

@@ -8,16 +8,67 @@ use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Progress of a run, as seen by the TUI.
+use crate::progress::Stage;
+
+/// What a line of output reports, so the TUI can color it without
+/// parsing the text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Plain,
+    /// The name of a file whose report follows.
+    Heading,
+    /// Secondary details, such as frame counts and timings.
+    Detail,
+    /// A successful size reduction.
+    Good,
+    /// Worth noticing, but not a failure.
+    Warning,
+    Error,
+    /// An important summary line.
+    Emphasis,
+    /// The run's total savings.
+    Total,
+}
+
+/// How one file ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileResult {
+    /// Processed, with the original and output sizes.
+    Done(u64, u64),
+    /// Cancelled by a stop request.
+    Stopped,
+    Failed,
+}
+
+/// Progress of a run, as seen by the TUI. Files are identified by their
+/// index in the run.
 pub enum Event {
-    /// One or more lines of output.
-    Text { text: String, error: bool },
+    /// One or more lines of output, written together.
+    Text(Vec<(Kind, String)>),
     /// Processing is about to start on `total` files.
-    Started { total: usize },
-    /// A file finished, with its sizes if it succeeded.
-    FileDone { sizes: Option<(u64, u64)> },
+    Started {
+        total: usize,
+    },
+    /// Work on a file has begun.
+    FileStarted {
+        index: usize,
+        name: String,
+    },
+    /// Progress within a file; `total` is 0 while it is unknown.
+    Progress {
+        index: usize,
+        stage: Stage,
+        done: usize,
+        total: usize,
+    },
+    FileDone {
+        index: usize,
+        result: FileResult,
+    },
     /// The run is over; `ok` is false if anything failed.
-    Finished { ok: bool },
+    Finished {
+        ok: bool,
+    },
 }
 
 pub enum Sink {
@@ -50,34 +101,49 @@ impl Output {
         Ok(())
     }
 
-    /// Writes `text`, which may span several lines, as one unit so that
-    /// output from parallel workers does not interleave.
+    /// Writes `text`, which may span several lines.
     pub fn line(&self, text: impl Into<String>) {
-        self.write(text.into(), false);
+        self.say(Kind::Plain, text);
     }
 
     pub fn error(&self, text: impl Into<String>) {
-        self.write(text.into(), true);
+        self.say(Kind::Error, text);
+    }
+
+    pub fn say(&self, kind: Kind, text: impl Into<String>) {
+        self.block(vec![(kind, text.into())]);
+    }
+
+    /// Writes `lines` as one unit so that output from parallel workers
+    /// does not interleave. On the console, a block containing an error
+    /// goes to stderr.
+    pub fn block(&self, lines: Vec<(Kind, String)>) {
+        let joined = || {
+            lines
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        if let Some(log) = &self.log {
+            let mut file = log.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = writeln!(file, "{}", joined());
+        }
+        match &self.sink {
+            Sink::Console if lines.iter().any(|(k, _)| *k == Kind::Error) => {
+                eprintln!("{}", joined())
+            }
+            Sink::Console => println!("{}", joined()),
+            Sink::Channel(tx) => {
+                let _ = tx.send(Event::Text(lines));
+            }
+        }
     }
 
     /// Reports progress; only the TUI shows it.
     pub fn event(&self, event: Event) {
         if let Sink::Channel(tx) = &self.sink {
             let _ = tx.send(event);
-        }
-    }
-
-    fn write(&self, text: String, error: bool) {
-        if let Some(log) = &self.log {
-            let mut file = log.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = writeln!(file, "{text}");
-        }
-        match &self.sink {
-            Sink::Console if error => eprintln!("{text}"),
-            Sink::Console => println!("{text}"),
-            Sink::Channel(tx) => {
-                let _ = tx.send(Event::Text { text, error });
-            }
         }
     }
 }
@@ -127,13 +193,22 @@ mod tests {
             out.error(format!("{run} error"));
             assert_eq!(rx.try_iter().count(), 2, "both lines reach the TUI");
         }
+        {
+            let mut out = Output::new(Sink::Channel(std::sync::mpsc::channel().0));
+            out.open_log(&path, "third").unwrap();
+            out.block(vec![
+                (Kind::Heading, "[1/1] a.gif".into()),
+                (Kind::Detail, "    done".into()),
+            ]);
+        }
         let log = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 7, "{log}");
+        assert_eq!(lines.len(), 11, "{log}");
         assert!(lines[0].starts_with("===== ") && lines[0].ends_with(" UTC: first ====="));
         assert_eq!(lines[1..4], ["first line", "first error", ""]);
         assert!(lines[4].ends_with(" UTC: second ====="));
-        assert_eq!(lines[5..], ["second line", "second error"]);
+        assert_eq!(lines[5..8], ["second line", "second error", ""]);
+        assert_eq!(lines[9..], ["[1/1] a.gif", "    done"]);
         std::fs::remove_file(&path).unwrap();
     }
 }

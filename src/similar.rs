@@ -18,6 +18,7 @@
 use anyhow::Result;
 
 use crate::composite::{Pixel, TRANSPARENT};
+use crate::progress::Progress;
 use crate::store::FrameStore;
 
 /// Radius used to mean "the whole frame".
@@ -72,16 +73,27 @@ impl Signature {
 /// Maps every stored frame id to the id of the earliest stored frame that is
 /// visually identical to it (possibly itself). Each frame is compared with
 /// that representative directly, so matches never drift through chains of
-/// slightly different frames.
-pub fn group_similar(store: &FrameStore, w: usize, h: usize) -> Result<Vec<usize>> {
+/// slightly different frames. Ticks `progress` once per stored frame.
+pub fn group_similar(
+    store: &FrameStore,
+    w: usize,
+    h: usize,
+    progress: &Progress,
+) -> Result<Vec<usize>> {
     let mut reps: Vec<(usize, Signature)> = Vec::new();
     let mut map = Vec::with_capacity(store.unique_count());
     for id in 0..store.unique_count() {
+        progress.tick()?;
         let frame = store.load(id)?;
         let sig = Signature::new(&frame, w, h);
         let mut found = None;
         for (rep, rep_sig) in &reps {
-            if sig.may_match(rep_sig) && visually_identical(&frame, &store.load(*rep)?, w, h) {
+            if !sig.may_match(rep_sig) {
+                continue;
+            }
+            // Comparing with many look-alike candidates can take a while.
+            progress.check()?;
+            if visually_identical(&frame, &store.load(*rep)?, w, h) {
                 found = Some(*rep);
                 break;
             }

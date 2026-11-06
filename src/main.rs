@@ -1,6 +1,7 @@
-//! Shrinks every GIF in the executable's directory (and its subdirectories
-//! with `--recursive`) by removing redundant frames and re-encoding only
-//! what changes between frames.
+//! Shrinks GIFs by removing redundant frames and re-encoding only what
+//! changes between frames. Processes the GIFs in the executable's directory
+//! (and its subdirectories with `--recursive`), or the files and folders
+//! given on the command line or dropped onto the executable.
 //!
 //! By default, frames that differ only by dithering noise are treated as the
 //! same image (see `similar`), so the output looks identical but is not
@@ -13,11 +14,13 @@
 //! kept only if it is smaller and passes the same verification; disable it
 //! with `--no-gifsicle`.
 //!
-//! Output:  `<exe dir>/gif_optimized/<relative path>.gif`
+//! Output:  `<input folder>/gif_optimized/<relative path>.gif`, skipped
+//!          when it is already newer than its source (unless `--force`)
 //! Temp:    `<exe dir>/gif_optimizing/` (removed when everything succeeds)
 //! Original GIFs are never modified or deleted, unless `--replace` is given:
-//! then each original is overwritten in place, but only when the result is
-//! smaller. Combine it with `--exact` to keep the replaced files lossless.
+//! then each original is overwritten in place, keeping its modified time,
+//! but only when the result is smaller. Replacing is lossless unless
+//! `--lossy` is also given.
 //!
 //! `--log` appends everything shown to `<exe dir>/gif_optimizer.log`.
 //! Started without arguments in a terminal, an interactive screen lets you
@@ -27,27 +30,58 @@ mod composite;
 mod encode;
 mod lzw;
 mod output;
+mod progress;
 mod similar;
 mod store;
 mod timeline;
 mod tui;
 
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 
 use composite::composite_frames;
-use output::{Event, Output, Sink};
+use output::{Event, FileResult, Kind, Output, Sink};
+use progress::{is_stopped, Progress, Stage};
 use store::FrameStore;
 use timeline::{collapse_repeats, merge_consecutive, TimelineFrame};
 
 const OUTPUT_DIR: &str = "gif_optimized";
 const WORK_DIR: &str = "gif_optimizing";
 const LOG_FILE: &str = "gif_optimizer.log";
+
+const HELP: &str = "\
+Usage: gif_optimizer [OPTIONS] [FILE.gif | FOLDER]...
+
+Shrinks GIFs by removing redundant frames and re-encoding only what changes
+between frames. Without paths, the GIFs next to the executable are processed;
+files and folders can also be dropped onto the executable. Started without
+arguments in a terminal, an interactive screen opens instead.
+
+Results are written to a gif_optimized folder next to each input. A GIF whose
+result there is already newer than the GIF itself is skipped.
+
+By default, frames that differ only by dithering noise are merged too: the
+result looks the same but may not be pixel-identical.
+
+Options:
+  --exact         Merge only pixel-identical frames, so results are lossless
+  --replace       Overwrite originals where the result is smaller, keeping
+                  their modified time. Lossless unless --lossy is given.
+  --lossy         With --replace, also merge frames that only look identical
+  --recursive     Also process GIFs in subfolders
+  --force         Process GIFs again even if their result is up to date
+  --no-gifsicle   Do not try gifsicle -O3 on the results
+  --jobs=N        Process N GIFs at a time (default: one per CPU core)
+  --log           Append all output to gif_optimizer.log next to the executable
+  --no-pause      Exit without waiting for Enter
+  -h, --help      Show this help
+";
 
 struct Report {
     original_frames: usize,
@@ -67,6 +101,8 @@ struct Report {
 #[derive(Clone)]
 struct Options {
     exact: bool,
+    /// Allow look-alike merging when replacing originals.
+    lossy: bool,
     gifsicle: bool,
     /// Number of GIFs processed at the same time.
     jobs: usize,
@@ -76,11 +112,37 @@ struct Options {
     recursive: bool,
     /// Append all output to `LOG_FILE`.
     log: bool,
+    /// Process GIFs even if their output is up to date.
+    force: bool,
+    /// Files and folders to process instead of the executable's directory.
+    paths: Vec<PathBuf>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            exact: false,
+            lossy: false,
+            gifsicle: true,
+            jobs: Self::default_jobs(),
+            replace: false,
+            recursive: false,
+            log: false,
+            force: false,
+            paths: Vec::new(),
+        }
+    }
 }
 
 impl Options {
     fn default_jobs() -> usize {
         std::thread::available_parallelism().map_or(1, |n| n.get())
+    }
+
+    /// Whether only pixel-identical frames may be merged. Replacing an
+    /// original cannot be undone, so it is lossless unless asked otherwise.
+    fn lossless(&self) -> bool {
+        self.exact || (self.replace && !self.lossy)
     }
 
     /// The command line that runs with these options, for the log header.
@@ -90,7 +152,9 @@ impl Options {
             (self.exact, "--exact"),
             (!self.gifsicle, "--no-gifsicle"),
             (self.replace, "--replace"),
+            (self.lossy, "--lossy"),
             (self.recursive, "--recursive"),
+            (self.force, "--force"),
             (self.log, "--log"),
         ] {
             if on {
@@ -98,30 +162,84 @@ impl Options {
                 cmd += flag;
             }
         }
-        cmd + &format!(" --jobs={}", self.jobs)
+        cmd += &format!(" --jobs={}", self.jobs);
+        for path in &self.paths {
+            cmd += &format!(" \"{}\"", path.display());
+        }
+        cmd
     }
 }
 
+enum Command {
+    Run { options: Options, pause: bool },
+    Help,
+}
+
+fn parse_args(args: &[OsString]) -> Result<Command, String> {
+    let mut options = Options::default();
+    let mut pause = true;
+    let mut flags_done = false;
+    for arg in args {
+        // Anything that is not an option (including non-UTF-8 names) is a path.
+        let flag = arg.to_str().filter(|a| !flags_done && a.starts_with('-'));
+        let Some(flag) = flag else {
+            if !flags_done && arg == "/?" {
+                return Ok(Command::Help);
+            }
+            options.paths.push(PathBuf::from(arg));
+            continue;
+        };
+        match flag {
+            "--" => flags_done = true,
+            "-h" | "--help" => return Ok(Command::Help),
+            "--exact" => options.exact = true,
+            "--lossy" => options.lossy = true,
+            "--no-gifsicle" => options.gifsicle = false,
+            "--replace" => options.replace = true,
+            "--recursive" => options.recursive = true,
+            "--force" => options.force = true,
+            "--log" => options.log = true,
+            "--no-pause" => pause = false,
+            _ => match flag.strip_prefix("--jobs=") {
+                Some(n) => {
+                    options.jobs = n.parse().ok().filter(|&n| n > 0).ok_or_else(|| {
+                        format!("invalid --jobs value {n:?}; expected a whole number above 0")
+                    })?;
+                }
+                None => return Err(format!("unknown option {flag}")),
+            },
+        }
+    }
+    if options.exact && options.lossy {
+        return Err("--exact and --lossy cannot be combined".to_string());
+    }
+    Ok(Command::Run { options, pause })
+}
+
+fn wait_for_enter() {
+    print!("\nPress Enter to exit...");
+    let _ = io::stdout().flush();
+    let _ = io::stdin().lock().read_line(&mut String::new());
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     if args.is_empty() && io::stdin().is_terminal() && io::stdout().is_terminal() {
         std::process::exit(tui::main());
     }
-    let has = |flag: &str| args.iter().any(|a| a == flag);
-    let pause = !has("--no-pause");
-    let jobs = args
-        .iter()
-        .find_map(|a| a.strip_prefix("--jobs="))
-        .and_then(|n| n.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(Options::default_jobs);
-    let options = Options {
-        exact: has("--exact"),
-        gifsicle: !has("--no-gifsicle"),
-        jobs,
-        replace: has("--replace"),
-        recursive: has("--recursive"),
-        log: has("--log"),
+    let (options, pause) = match parse_args(&args) {
+        Ok(Command::Run { options, pause }) => (options, pause),
+        Ok(Command::Help) => {
+            print!("{HELP}");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("Error: {e}\nRun with --help to see the options.");
+            if !args.iter().any(|a| a == "--no-pause") {
+                wait_for_enter();
+            }
+            std::process::exit(2);
+        }
     };
     let mut out = Output::new(Sink::Console);
     if options.log {
@@ -135,9 +253,7 @@ fn main() {
         1
     };
     if pause {
-        print!("\nPress Enter to exit...");
-        let _ = io::stdout().flush();
-        let _ = io::stdin().lock().read_line(&mut String::new());
+        wait_for_enter();
     }
     std::process::exit(code);
 }
@@ -168,41 +284,153 @@ fn run_reported(options: &Options, out: &Output, stop: &AtomicBool) -> bool {
     }
 }
 
+/// One GIF to process.
+struct Job {
+    src: PathBuf,
+    /// Where the result goes; `src` itself when replacing.
+    dest: PathBuf,
+    /// How the file is named in the output.
+    name: String,
+}
+
+impl Job {
+    /// A job for `src`, found under `root`, named relative to `name_root`.
+    fn new(root: &Path, name_root: &Path, src: PathBuf, replace: bool) -> Self {
+        let dest = if replace {
+            src.clone()
+        } else {
+            root.join(OUTPUT_DIR)
+                .join(src.strip_prefix(root).unwrap_or(&src))
+        };
+        let name = src
+            .strip_prefix(name_root)
+            .unwrap_or(&src)
+            .display()
+            .to_string();
+        Self { src, dest, name }
+    }
+
+    /// Whether a previous run already wrote a result that is at least as
+    /// new as the source. Replaced originals cannot be recognized.
+    fn up_to_date(&self) -> bool {
+        let modified = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
+        self.dest != self.src
+            && matches!(
+                (modified(&self.src), modified(&self.dest)),
+                (Some(src), Some(dest)) if dest >= src
+            )
+    }
+}
+
+fn is_gif(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("gif"))
+}
+
+/// The GIFs to process: those in `base_dir`, or in the given files and
+/// folders. Also returns how many given paths could not be used; each is
+/// reported.
+fn collect_jobs(
+    options: &Options,
+    base_dir: &Path,
+    work_root: &Path,
+    out: &Output,
+) -> Result<(Vec<Job>, usize)> {
+    let skip = |root: &Path| [root.join(OUTPUT_DIR), work_root.to_path_buf()];
+    let mut jobs = Vec::new();
+    if options.paths.is_empty() {
+        for src in find_gifs(base_dir, options.recursive, &skip(base_dir), out)? {
+            jobs.push(Job::new(base_dir, base_dir, src, options.replace));
+        }
+    }
+    let mut problems = 0;
+    for path in &options.paths {
+        if path.is_dir() {
+            // Name files including the folder itself, as it was given.
+            let name_root = path.parent().unwrap_or(path);
+            match find_gifs(path, options.recursive, &skip(path), out) {
+                Ok(gifs) => jobs.extend(
+                    gifs.into_iter()
+                        .map(|src| Job::new(path, name_root, src, options.replace)),
+                ),
+                Err(e) => {
+                    out.error(format!("Skipping {}: {e:#}", path.display()));
+                    problems += 1;
+                }
+            }
+        } else if path.is_file() && is_gif(path) {
+            let parent = path.parent().unwrap_or(Path::new(""));
+            jobs.push(Job::new(parent, parent, path.clone(), options.replace));
+        } else {
+            let reason = if path.exists() {
+                "not a .gif file"
+            } else {
+                "not found"
+            };
+            out.error(format!("Skipping {}: {reason}", path.display()));
+            problems += 1;
+        }
+    }
+    jobs.sort_by(|a, b| a.src.cmp(&b.src));
+    jobs.dedup_by(|a, b| a.src == b.src);
+    Ok((jobs, problems))
+}
+
 /// Returns `Ok(true)` if every GIF was processed without errors. Once
-/// `stop` is set, no further GIFs are started.
+/// `stop` is set, no further GIFs are started and those in progress are
+/// cancelled.
 fn run(options: &Options, out: &Output, stop: &AtomicBool) -> Result<bool> {
     let base_dir = base_dir()?;
-    let out_dir = base_dir.join(OUTPUT_DIR);
     let work_root = base_dir.join(WORK_DIR);
-    let skip = [out_dir.clone(), work_root.clone()];
-    out.line(format!("GIF Optimizer - {}", base_dir.display()));
-    let gifs = find_gifs(&base_dir, options.recursive, &skip, out)?;
-    out.event(Event::Started { total: gifs.len() });
-    if gifs.is_empty() {
-        out.line("No GIF files found.");
-        return Ok(true);
+    out.line(if options.paths.is_empty() {
+        format!("GIF Optimizer - {}", base_dir.display())
+    } else {
+        format!("GIF Optimizer - {} path(s) given", options.paths.len())
+    });
+    let (mut jobs, problems) = collect_jobs(options, &base_dir, &work_root, out)?;
+    let found = jobs.len();
+    if !options.force && !options.replace {
+        jobs.retain(|j| !j.up_to_date());
     }
-    out.line(format!("Found {} GIF file(s).", gifs.len()));
+    let up_to_date = found - jobs.len();
+    out.event(Event::Started { total: jobs.len() });
+    if found == 0 {
+        out.line("No GIF files found.");
+        return Ok(problems == 0);
+    }
+    out.say(Kind::Emphasis, format!("Found {found} GIF file(s)."));
+    if up_to_date > 0 {
+        out.line(format!(
+            "Skipping {up_to_date} with an up-to-date result in {OUTPUT_DIR}; \
+             use --force to process them again."
+        ));
+    }
+    if jobs.is_empty() {
+        out.line("Nothing left to do.");
+        return Ok(problems == 0);
+    }
     if options.replace {
-        out.line("Originals will be replaced where the result is smaller.");
-        if !options.exact {
-            out.line("Look-alike frames may be merged; add --exact to keep them lossless.");
+        out.say(
+            Kind::Warning,
+            "Originals will be replaced where the result is smaller.",
+        );
+        if !options.lossless() {
+            out.say(
+                Kind::Warning,
+                "Look-alike frames may be merged (--lossy), so replaced files may not be pixel-identical.",
+            );
         }
     }
     out.line("");
 
-    if !options.replace {
-        fs::create_dir_all(&out_dir)
-            .with_context(|| format!("cannot create {}", out_dir.display()))?;
-    }
     fs::create_dir_all(&work_root)
         .with_context(|| format!("cannot create {}", work_root.display()))?;
 
     let gifsicle_version = options.gifsicle.then(gifsicle_version).flatten();
     let use_gifsicle = gifsicle_version.is_some();
-    let jobs = options.jobs.min(gifs.len());
+    let workers = options.jobs.min(jobs.len());
     out.line(format!(
-        "Processing {jobs} at a time; gifsicle {}.\n",
+        "Processing {workers} at a time; gifsicle {}.\n",
         match (options.gifsicle, &gifsicle_version) {
             (false, _) => "disabled".to_string(),
             (true, None) => "not found (install it for slightly smaller files)".to_string(),
@@ -216,94 +444,131 @@ fn run(options: &Options, out: &Output, stop: &AtomicBool) -> Result<bool> {
     // completion rather than the file list.
     let next = AtomicUsize::new(0);
     let started_all = Instant::now();
-    let (errors, total_in, total_out) = std::thread::scope(|s| {
-        let workers: Vec<_> = (0..jobs)
+    let (errors, stopped, total_in, total_out) = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
             .map(|_| {
                 s.spawn(|| {
-                    let (mut errors, mut total_in, mut total_out) = (0usize, 0u64, 0u64);
+                    let (mut errors, mut stopped) = (0usize, 0usize);
+                    let (mut total_in, mut total_out) = (0u64, 0u64);
                     while !stop.load(Ordering::Relaxed) {
                         let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(src) = gifs.get(i) else { break };
-                        let work_dir = work_root.join(work_dir_name(i, src));
-                        let rel = src.strip_prefix(&base_dir).unwrap_or(src);
-                        let dest = if options.replace {
-                            src.clone()
-                        } else {
-                            out_dir.join(rel)
-                        };
+                        let Some(job) = jobs.get(i) else { break };
+                        let work_dir = work_root.join(work_dir_name(i, &job.src));
+                        out.event(Event::FileStarted {
+                            index: i,
+                            name: job.name.clone(),
+                        });
+                        let progress = Progress::new(stop, out, i);
                         let started = Instant::now();
-                        let result =
-                            process_gif(src, &dest, &work_dir, options.exact, use_gifsicle);
-                        let header = format!("[{}/{}] {}", i + 1, gifs.len(), rel.display());
-                        match result {
+                        let result = process_gif(
+                            &job.src,
+                            &job.dest,
+                            &work_dir,
+                            options.lossless(),
+                            use_gifsicle,
+                            &progress,
+                        );
+                        let header = (
+                            Kind::Heading,
+                            format!("[{}/{}] {}", i + 1, jobs.len(), job.name),
+                        );
+                        let file_result = match result {
                             Ok(r) => {
                                 total_in += r.original_size;
                                 total_out += r.output_size;
-                                out.line(format!("{header}\n{}", describe(&r, started)));
-                                out.event(Event::FileDone {
-                                    sizes: Some((r.original_size, r.output_size)),
-                                });
+                                out.block([vec![header], describe(&r, started)].concat());
+                                FileResult::Done(r.original_size, r.output_size)
+                            }
+                            Err(e) if is_stopped(&e) => {
+                                stopped += 1;
+                                // A partial result is of no use for a later run.
+                                let _ = fs::remove_dir_all(&work_dir);
+                                out.block(vec![
+                                    header,
+                                    (Kind::Warning, "    stopped before finishing".into()),
+                                ]);
+                                FileResult::Stopped
                             }
                             Err(e) => {
                                 errors += 1;
-                                out.error(format!(
-                                    "{header}\n    ERROR: {e:#}\n    temporary files kept in {}",
-                                    work_dir.display()
-                                ));
-                                out.event(Event::FileDone { sizes: None });
+                                out.block(vec![
+                                    header,
+                                    (Kind::Error, format!("    ERROR: {e:#}")),
+                                    (
+                                        Kind::Error,
+                                        format!(
+                                            "    temporary files kept in {}",
+                                            work_dir.display()
+                                        ),
+                                    ),
+                                ]);
+                                FileResult::Failed
                             }
-                        }
+                        };
+                        out.event(Event::FileDone {
+                            index: i,
+                            result: file_result,
+                        });
                     }
-                    (errors, total_in, total_out)
+                    (errors, stopped, total_in, total_out)
                 })
             })
             .collect();
-        workers
-            .into_iter()
-            .map(join)
-            .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+        handles.into_iter().map(join).fold((0, 0, 0, 0), |a, b| {
+            (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3)
+        })
     });
 
     out.line("");
-    let skipped = gifs.len().saturating_sub(next.load(Ordering::Relaxed));
-    if skipped > 0 {
-        out.line(format!(
-            "Stopped early; {skipped} GIF(s) were not processed."
-        ));
+    let unprocessed = jobs.len().saturating_sub(next.load(Ordering::Relaxed)) + stopped;
+    if unprocessed > 0 {
+        out.say(
+            Kind::Warning,
+            format!("Stopped early; {unprocessed} GIF(s) were not processed."),
+        );
     }
     if total_in > 0 {
-        out.line(format!(
-            "Total: {} -> {} (saved {})",
-            format_size(total_in),
-            format_size(total_out),
-            format_size(total_in.saturating_sub(total_out))
-        ));
+        out.say(
+            Kind::Total,
+            format!(
+                "Total: {} -> {} (saved {})",
+                format_size(total_in),
+                format_size(total_out),
+                format_size(total_in.saturating_sub(total_out))
+            ),
+        );
     }
-    out.line(format!(
-        "Finished in {:.1}s",
-        started_all.elapsed().as_secs_f64()
-    ));
+    out.say(
+        Kind::Emphasis,
+        format!("Finished in {:.1}s", started_all.elapsed().as_secs_f64()),
+    );
     if options.replace {
         out.line("Smaller results replaced their originals.");
+    } else if options.paths.is_empty() {
+        out.line(format!(
+            "Optimized GIFs are in {}",
+            base_dir.join(OUTPUT_DIR).display()
+        ));
     } else {
-        out.line(format!("Optimized GIFs are in {}", out_dir.display()));
+        out.line(format!(
+            "Optimized GIFs are in the {OUTPUT_DIR} folder next to each input."
+        ));
     }
 
     if errors == 0 {
         fs::remove_dir_all(&work_root)
             .with_context(|| format!("cannot remove {}", work_root.display()))?;
-        Ok(true)
     } else {
         out.error(format!(
             "{errors} GIF(s) failed; {} was left in place.",
             work_root.display()
         ));
-        Ok(false)
     }
+    Ok(errors == 0 && problems == 0)
 }
 
 /// The per-file report lines, without the header.
-fn describe(r: &Report, started: Instant) -> String {
+fn describe(r: &Report, started: Instant) -> Vec<(Kind, String)> {
     let visual = if r.visual_unique_frames < r.unique_frames {
         format!(", {} after merging look-alikes", r.visual_unique_frames)
     } else {
@@ -314,15 +579,19 @@ fn describe(r: &Report, started: Instant) -> String {
     } else {
         String::new()
     };
-    let mut out = format!(
-        "    frames: {} -> {} ({} unique{visual}{folded})\n",
-        r.original_frames, r.output_frames, r.unique_frames,
-    );
+    let mut lines = vec![(
+        Kind::Detail,
+        format!(
+            "    frames: {} -> {} ({} unique{visual}{folded})",
+            r.original_frames, r.output_frames, r.unique_frames,
+        ),
+    )];
     match &r.kept_original {
-        Some(reason) => out += &format!("    kept original file: {reason}\n"),
-        None => {
-            out += &format!(
-                "    size:   {} -> {} ({:.1}% smaller), {}{}\n",
+        Some(reason) => lines.push((Kind::Warning, format!("    kept original file: {reason}"))),
+        None => lines.push((
+            Kind::Good,
+            format!(
+                "    size:   {} -> {} ({:.1}% smaller), {}{}",
                 format_size(r.original_size),
                 format_size(r.output_size),
                 100.0 * (1.0 - r.output_size as f64 / r.original_size as f64),
@@ -336,11 +605,14 @@ fn describe(r: &Report, started: Instant) -> String {
                 } else {
                     ""
                 },
-            )
-        }
+            ),
+        )),
     }
-    out += &format!("    done in {:.1}s", started.elapsed().as_secs_f64());
-    out
+    lines.push((
+        Kind::Detail,
+        format!("    done in {:.1}s", started.elapsed().as_secs_f64()),
+    ));
+    lines
 }
 
 /// First line of `gifsicle --version`, or `None` if gifsicle is not usable.
@@ -384,11 +656,7 @@ fn find_gifs(dir: &Path, recursive: bool, skip: &[PathBuf], out: &Output) -> Res
                 if recursive && !skip.contains(&path) {
                     pending.push(path);
                 }
-            } else if path.is_file()
-                && path
-                    .extension()
-                    .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("gif"))
-            {
+            } else if path.is_file() && is_gif(&path) {
                 gifs.push(path);
             }
         }
@@ -429,56 +697,88 @@ type Candidate = (
 );
 
 /// Encodes the timeline with visually identical frames merged, or returns
-/// `None` if no frames look alike.
+/// `None` if no frames look alike. The caller reserves progress for
+/// grouping (one unit per stored frame) and `4 * raw.len()` for encoding.
 fn lookalike_candidate(
     store: &FrameStore,
     raw: &[TimelineFrame],
     info: &composite::GifInfo,
+    progress: &Progress,
 ) -> Result<Option<Candidate>> {
     let (w, h) = (info.width as usize, info.height as usize);
-    let canonical = similar::group_similar(store, w, h)?;
+    let canonical = similar::group_similar(store, w, h, progress)?;
     let visual_unique = canonical
         .iter()
         .enumerate()
         .filter(|&(i, &c)| i == c)
         .count();
     if visual_unique == store.unique_count() {
+        progress.skip(OPTIMIZE_PASSES * raw.len());
         return Ok(None);
     }
     let plan = plan_timeline(raw, &canonical, info.repeat);
-    let encoded = optimize(store, &plan.0, info.width, info.height, plan.1);
+    progress.skip(OPTIMIZE_PASSES * raw.len().saturating_sub(plan.0.len()));
+    let encoded = optimize(store, &plan.0, info.width, info.height, plan.1, progress);
     Ok(Some((encoded, plan, visual_unique)))
 }
 
 /// Runs `gifsicle -O3` on `bytes`. Returns `None` if gifsicle is not
-/// installed or fails.
-fn gifsicle(bytes: &[u8], work_dir: &Path) -> Option<Vec<u8>> {
+/// installed or fails, and an error if stopped while it runs.
+fn gifsicle(bytes: &[u8], work_dir: &Path, progress: &Progress) -> Result<Option<Vec<u8>>> {
     let (input, output) = (work_dir.join("pre.gif"), work_dir.join("gifsicle.gif"));
-    fs::write(&input, bytes).ok()?;
-    let status = std::process::Command::new("gifsicle")
-        .args(["-O3", "--no-warnings", "-o"])
-        .arg(&output)
-        .arg(&input)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?;
-    let result = status.success().then(|| fs::read(&output).ok()).flatten();
+    if fs::write(&input, bytes).is_err() {
+        return Ok(None);
+    }
+    let result = run_gifsicle(&input, &output, progress);
     let _ = fs::remove_file(&input);
     let _ = fs::remove_file(&output);
     result
 }
 
+fn run_gifsicle(input: &Path, output: &Path, progress: &Progress) -> Result<Option<Vec<u8>>> {
+    let Ok(mut child) = std::process::Command::new("gifsicle")
+        .args(["-O3", "--no-warnings", "-o"])
+        .arg(output)
+        .arg(input)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return Ok(None);
+    };
+    // Poll instead of waiting, so that a stop request can kill it.
+    loop {
+        let checked = progress.check();
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(status.success().then(|| fs::read(output).ok()).flatten());
+            }
+            Ok(None) if checked.is_ok() => std::thread::sleep(Duration::from_millis(20)),
+            // Stopped, or the process could not be queried.
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                checked?;
+                return Ok(None);
+            }
+        }
+    }
+}
+
 /// Optimizes `src` and writes the result to `dest`, which may be `src`
 /// itself. If the result is not smaller, the original is copied to `dest`.
+/// Stops with an error as soon as `progress` reports a stop request; `dest`
+/// is then left untouched.
 fn process_gif(
     src: &Path,
     dest: &Path,
     work_dir: &Path,
     exact: bool,
     use_gifsicle: bool,
+    progress: &Progress,
 ) -> Result<Report> {
+    progress.stage(Stage::Reading)?;
     if work_dir.exists() {
         fs::remove_dir_all(work_dir)?;
     }
@@ -489,6 +789,7 @@ fn process_gif(
     let mut raw = Vec::new();
     let file = File::open(src).with_context(|| format!("cannot open {}", src.display()))?;
     let info = composite_frames(file, |canvas, delay| {
+        progress.tick()?;
         let id = store.insert(canvas)?;
         raw.push(TimelineFrame { id, delay });
         Ok(())
@@ -502,18 +803,28 @@ fn process_gif(
     //    differ only by dithering noise are also tried as the same image, in
     //    parallel. Merging look-alikes can make the changes between
     //    consecutive frames larger, so it is kept only if the file shrinks.
+    progress.stage(Stage::Optimizing)?;
     let identity: Vec<usize> = (0..store.unique_count()).collect();
     let exact_plan = plan_timeline(&raw, &identity, info.repeat);
+    // Reserve all the work up front, so the fraction done only grows.
+    progress.expect(OPTIMIZE_PASSES * exact_plan.0.len());
+    if !exact {
+        progress.expect(store.unique_count() + OPTIMIZE_PASSES * raw.len());
+    }
     let (exact_encoded, lookalike) = std::thread::scope(|s| {
-        let exact_job =
-            s.spawn(|| optimize(&store, &exact_plan.0, info.width, info.height, exact_plan.1));
+        let exact_job = s.spawn(|| {
+            let (timeline, repeat) = (&exact_plan.0, exact_plan.1);
+            optimize(&store, timeline, info.width, info.height, repeat, progress)
+        });
         let lookalike = if exact {
             Ok(None)
         } else {
-            lookalike_candidate(&store, &raw, &info)
+            lookalike_candidate(&store, &raw, &info, progress)
         };
         (join(exact_job), lookalike)
     });
+    // A stopped candidate fails like a broken one; do not mistake it for that.
+    progress.check()?;
     let mut chosen = (exact_encoded, exact_plan, store.unique_count());
     if let Some((encoded, plan, visual_unique)) = lookalike? {
         let smaller = match (&encoded, &chosen.0) {
@@ -532,26 +843,37 @@ fn process_gif(
     let mut used_gifsicle = false;
     if use_gifsicle {
         if let Ok(bytes) = &encoded {
-            if let Some(g) = gifsicle(bytes, work_dir) {
-                if g.len() < bytes.len()
-                    && encode::verify(&g, &store, &timeline, info.width, info.height, repeat)
-                        .is_ok()
-                {
-                    encoded = Ok(g);
-                    used_gifsicle = true;
+            progress.stage(Stage::Gifsicle)?;
+            if let Some(g) = gifsicle(bytes, work_dir, progress)? {
+                if g.len() < bytes.len() {
+                    progress.expect(timeline.len());
+                    let (w, h) = (info.width, info.height);
+                    if encode::verify(&g, &store, &timeline, w, h, repeat, progress).is_ok() {
+                        encoded = Ok(g);
+                        used_gifsicle = true;
+                    }
                 }
             }
         }
     }
+    progress.check()?;
 
-    let original_size = fs::metadata(src)?.len();
+    let src_meta = fs::metadata(src)?;
+    let original_size = src_meta.len();
+    // A replaced original keeps its modified time, so it still sorts and
+    // syncs like before.
+    let modified = if dest == src {
+        src_meta.modified().ok()
+    } else {
+        None
+    };
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
     let (output_size, kept_original) = match encoded {
         Ok(bytes) if (bytes.len() as u64) < original_size => {
-            write_atomically(dest, &bytes)?;
+            write_atomically(dest, &bytes, modified)?;
             (bytes.len() as u64, None)
         }
         other => {
@@ -586,14 +908,23 @@ fn process_gif(
 
 /// Writes `bytes` to a temporary file next to `dest`, then renames it over
 /// `dest`, so `dest` is never left half-written (it may be an original).
-fn write_atomically(dest: &Path, bytes: &[u8]) -> Result<()> {
+/// The file gets `modified` as its modified time, if given.
+fn write_atomically(dest: &Path, bytes: &[u8], modified: Option<SystemTime>) -> Result<()> {
     let mut temp_name = dest
         .file_name()
         .context("output has no file name")?
         .to_owned();
     temp_name.push(".optimizing");
     let temp = dest.with_file_name(temp_name);
-    let result = fs::write(&temp, bytes)
+    let write = || -> io::Result<()> {
+        let mut file = File::create(&temp)?;
+        file.write_all(bytes)?;
+        if let Some(time) = modified {
+            file.set_modified(time)?;
+        }
+        Ok(())
+    };
+    let result = write()
         .with_context(|| format!("cannot write {}", temp.display()))
         .and_then(|()| {
             fs::rename(&temp, dest).with_context(|| format!("cannot replace {}", dest.display()))
@@ -621,23 +952,46 @@ fn plan_timeline(
     collapse_repeats(merge_consecutive(&grouped), repeat)
 }
 
+/// Passes over the timeline in `optimize`: planning, encoding with local
+/// and with global palettes, and verifying.
+const OPTIMIZE_PASSES: usize = 4;
+
+/// Encodes and verifies `timeline`. The caller reserves `OPTIMIZE_PASSES`
+/// progress units per frame.
 fn optimize(
     store: &FrameStore,
     timeline: &[TimelineFrame],
     width: u16,
     height: u16,
     repeat: gif::Repeat,
+    progress: &Progress,
 ) -> Result<Vec<u8>> {
-    let plans = encode::plan_frames(store, timeline, width, height)?;
+    let plans = encode::plan_frames(store, timeline, width, height, progress)?;
 
     // Per-frame palettes are smaller for some GIFs, one shared palette for
     // others; try both in parallel and keep the smaller file.
     let global = encode::global_palette(&plans);
+    if global.is_none() {
+        progress.skip(timeline.len());
+    }
     let (local, shared) = std::thread::scope(|s| {
         let shared = global.as_ref().map(|g| {
-            s.spawn(|| encode::encode(store, timeline, &plans, width, height, repeat, Some(g)))
+            s.spawn(|| {
+                encode::encode(
+                    store,
+                    timeline,
+                    &plans,
+                    width,
+                    height,
+                    repeat,
+                    Some(g),
+                    progress,
+                )
+            })
         });
-        let local = encode::encode(store, timeline, &plans, width, height, repeat, None);
+        let local = encode::encode(
+            store, timeline, &plans, width, height, repeat, None, progress,
+        );
         (local, shared.map(join))
     });
     let mut best = local?;
@@ -647,7 +1001,7 @@ fn optimize(
         }
     }
 
-    encode::verify(&best, store, timeline, width, height, repeat)?;
+    encode::verify(&best, store, timeline, width, height, repeat, progress)?;
     Ok(best)
 }
 
@@ -673,6 +1027,12 @@ mod tests {
 
     const W: u16 = 48;
     const H: u16 = 48;
+
+    static NEVER: AtomicBool = AtomicBool::new(false);
+
+    fn process(src: &Path, dest: &Path, work_dir: &Path, exact: bool) -> Result<Report> {
+        process_gif(src, dest, work_dir, exact, false, &Progress::silent(&NEVER))
+    }
 
     /// A distinct, non-trivial image per `seed` (gradient plus a moving box).
     fn image(seed: u8, transparent_box: bool) -> Vec<u8> {
@@ -778,7 +1138,7 @@ mod tests {
         let original = fs::read(&src).unwrap();
 
         let dest = out_dir.join(format!("{name}.gif"));
-        let report = process_gif(&src, &dest, &work_dir, false, false).unwrap();
+        let report = process(&src, &dest, &work_dir, false).unwrap();
 
         assert_eq!(fs::read(&src).unwrap(), original, "original was modified");
         assert!(!work_dir.exists(), "work dir not cleaned up");
@@ -881,11 +1241,11 @@ mod tests {
         write_frames(&src, frames, Repeat::Infinite, false);
 
         let dest = out_dir.join("dithered.gif");
-        let exact = process_gif(&src, &dest, &root.join("work_exact"), true, false).unwrap();
+        let exact = process(&src, &dest, &root.join("work_exact"), true).unwrap();
         assert_eq!(exact.unique_frames, 6, "dithered frames should all differ");
         assert_eq!(exact.cycles_folded, 1);
 
-        let r = process_gif(&src, &dest, &root.join("work"), false, false).unwrap();
+        let r = process(&src, &dest, &root.join("work"), false).unwrap();
         assert_eq!(r.visual_unique_frames, 2);
         assert_eq!(r.output_frames, 2);
         assert_eq!(r.cycles_folded, 3);
@@ -914,10 +1274,19 @@ mod tests {
         write_gif(&src, &[1, 1, 2, 2, 1, 1, 2, 2], Repeat::Infinite, false);
         let original_size = fs::metadata(&src).unwrap().len();
         let (before, _) = playback(&src);
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+        File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
 
-        let r = process_gif(&src, &src, &root.join("work"), true, false).unwrap();
+        let r = process(&src, &src, &root.join("work"), true).unwrap();
         assert!(r.kept_original.is_none(), "{:?}", r.kept_original);
-        assert!(fs::metadata(&src).unwrap().len() < original_size);
+        let meta = fs::metadata(&src).unwrap();
+        assert!(meta.len() < original_size);
+        assert_eq!(meta.modified().unwrap(), old, "modified time is kept");
         let (after, _) = playback(&src);
         let unrolled: Vec<_> = (0..r.cycles_folded)
             .flat_map(|_| after.iter().cloned())
@@ -926,6 +1295,152 @@ mod tests {
         let leftovers: Vec<_> = fs::read_dir(&root).unwrap().collect();
         assert_eq!(leftovers.len(), 1, "temporary files left behind");
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn stop_cancels_without_writing() {
+        let root = std::env::temp_dir().join("gif_optimizer_test_stop");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let src = root.join("stop.gif");
+        write_gif(&src, &[1, 2, 1, 2], Repeat::Infinite, false);
+        let original = fs::read(&src).unwrap();
+        let stop = AtomicBool::new(true);
+        let progress = Progress::silent(&stop);
+        for dest in [root.join("out.gif"), src.clone()] {
+            let result = process_gif(&src, &dest, &root.join("work"), false, false, &progress);
+            let e = result.err().expect("a stopped file must fail");
+            assert!(is_stopped(&e), "{e:#}");
+        }
+        assert!(!root.join("out.gif").exists());
+        assert_eq!(fs::read(&src).unwrap(), original);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn parse(args: &[&str]) -> Result<Command, String> {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        parse_args(&args)
+    }
+
+    #[test]
+    fn arguments_are_validated() {
+        let Ok(Command::Run { options, pause }) = parse(&[
+            "--replace",
+            "a.gif",
+            "--jobs=3",
+            "--no-pause",
+            "--",
+            "--odd",
+        ]) else {
+            panic!("valid arguments rejected");
+        };
+        assert!(!pause && options.replace && options.jobs == 3);
+        assert!(options.lossless(), "replacing is lossless by default");
+        let paths: Vec<_> = options.paths.iter().map(|p| p.to_str().unwrap()).collect();
+        assert_eq!(paths, ["a.gif", "--odd"]);
+        assert!(options.command().ends_with("--jobs=3 \"a.gif\" \"--odd\""));
+
+        let Ok(Command::Run { options, .. }) = parse(&["--replace", "--lossy"]) else {
+            panic!("--lossy rejected");
+        };
+        assert!(!options.lossless());
+        let Ok(Command::Run { options, .. }) = parse(&[]) else {
+            panic!("no arguments rejected");
+        };
+        assert!(!options.lossless() && options.paths.is_empty());
+
+        for help in ["-h", "--help", "/?"] {
+            assert!(matches!(parse(&["--exact", help]), Ok(Command::Help)));
+        }
+        assert!(HELP.contains(OUTPUT_DIR) && HELP.contains(LOG_FILE));
+        for bad in ["--jobs=0", "--jobs=x", "--jobs=", "--jobs", "--exat", "-x"] {
+            let e = parse(&[bad])
+                .err()
+                .unwrap_or_else(|| panic!("{bad} accepted"));
+            assert!(e.contains("--jobs") || e.contains(bad), "{e}");
+        }
+        assert!(parse(&["--exact", "--lossy"]).is_err());
+    }
+
+    #[test]
+    fn given_paths_are_collected() {
+        let root = std::env::temp_dir().join("gif_optimizer_test_paths");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("anims/sub")).unwrap();
+        fs::create_dir_all(root.join("anims").join(OUTPUT_DIR)).unwrap();
+        for file in [
+            "single.gif",
+            "note.txt",
+            "anims/a.gif",
+            "anims/sub/b.gif",
+            "anims/gif_optimized/old.gif",
+        ] {
+            fs::write(root.join(file), b"").unwrap();
+        }
+        let options = Options {
+            recursive: true,
+            paths: [
+                "single.gif",
+                "anims",
+                "note.txt",
+                "missing.gif",
+                "single.gif",
+            ]
+            .iter()
+            .map(|p| root.join(p))
+            .collect(),
+            ..Options::default()
+        };
+        let out = Output::new(Sink::Console);
+        let work_root = root.join(WORK_DIR);
+        let (jobs, problems) = collect_jobs(&options, &root, &work_root, &out).unwrap();
+        assert_eq!(problems, 2, "the text file and the missing file");
+        let rel = |p: &Path| {
+            p.strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        let found: Vec<_> = jobs
+            .iter()
+            .map(|j| (j.name.replace('\\', "/"), rel(&j.dest)))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("anims/a.gif".into(), "anims/gif_optimized/a.gif".into()),
+                (
+                    "anims/sub/b.gif".into(),
+                    "anims/gif_optimized/sub/b.gif".into()
+                ),
+                ("single.gif".into(), "gif_optimized/single.gif".into()),
+            ] as [(String, String); 3]
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn outputs_newer_than_their_source_are_up_to_date() {
+        let root = std::env::temp_dir().join("gif_optimizer_test_up_to_date");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(OUTPUT_DIR)).unwrap();
+        let src = root.join("a.gif");
+        fs::write(&src, b"").unwrap();
+        let job = Job::new(&root, &root, src.clone(), false);
+        assert!(!job.up_to_date(), "no output yet");
+        fs::write(&job.dest, b"").unwrap();
+        let set = |p: &Path, secs: u64| {
+            let t = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+            let file = File::options().write(true).open(p).unwrap();
+            file.set_modified(t).unwrap();
+        };
+        set(&src, 2_000);
+        set(&job.dest, 1_000);
+        assert!(!job.up_to_date(), "source changed since");
+        set(&job.dest, 2_000);
+        assert!(job.up_to_date());
+        assert!(!Job::new(&root, &root, src, true).up_to_date(), "replacing");
         fs::remove_dir_all(&root).unwrap();
     }
 
