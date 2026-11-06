@@ -58,7 +58,8 @@ Without paths, the GIFs next to the executable are processed.
 | `--replace`     | Overwrite originals where the result is smaller (see below)         |
 | `--lossy`       | With `--replace`, also merge frames that only look identical        |
 | `--recursive`   | Also process GIFs in subfolders                                     |
-| `--force`       | Process GIFs again even if their result is up to date               |
+| `--force`       | Process GIFs again even if already optimized or up to date          |
+| `--import-log=FILE` | Record the GIFs a previous run reported in its log (see below)  |
 | `--no-gifsicle` | Do not try `gifsicle -O3` on the results                            |
 | `--jobs=N`      | Process N GIFs at a time (default: 4)                               |
 | `--log`         | Append all output to `gif_optimizer.log` next to the executable     |
@@ -74,8 +75,32 @@ By default, originals are never modified. Results are written to a
 `gif_optimized` folder next to each input, with the same relative path.
 
 On later runs, a GIF is skipped if its result in `gif_optimized` is already
-newer than the GIF. Use `--force` (or **Redo up-to-date GIFs** on the
-interactive screen) to process it again, for example after changing options.
+newer than the GIF, or if the GIF is already optimized. Use `--force` (or
+**Redo optimized GIFs** on the interactive screen) to process it again.
+
+## Remembering optimized GIFs
+
+Already optimized GIFs are recognized in two ways, so either is enough:
+
+- **A marker inside the GIF.** Every GIF the program writes gets a small
+  application extension (17 bytes) that viewers ignore. It stays with the
+  file wherever it is moved or copied, for example over its original.
+- **`gif_optimizer.done` next to the executable.** It lists every finished
+  file by path, size, modified time and a hash of its content. Unchanged
+  files are recognized without being read; moved or renamed ones are
+  recognized by content when read. This also covers GIFs that were kept as
+  they were because nothing could be saved, which get no marker.
+
+Both note whether the GIF was finished losslessly (`--exact`, or `--replace`
+without `--lossy`). Such a GIF is processed again by a run that may merge
+look-alike frames, since that may shrink it further.
+
+GIFs optimized by versions before 0.2.0 have neither. If you still have the
+log of those runs, `gif_optimizer --import-log=gif_optimizer.log` adds the
+GIFs it reports to `gif_optimizer.done`, without optimizing anything. A GIF
+is only added if it is still where the run left it (or was moved over its
+original), has the size the log reports for its result, and was not changed
+after that run. Each added GIF is read once to record its content.
 
 With `--replace`, each original is overwritten in place, but only when the
 result is smaller. The original's modified time is kept. Because this cannot

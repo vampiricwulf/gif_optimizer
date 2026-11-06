@@ -149,6 +149,8 @@ struct RunView {
     excluded: usize,
     /// Files skipped because they are not GIFs; counted in `done` too.
     not_gifs: usize,
+    /// Files recognized as already optimized once read; in `done` too.
+    already: usize,
     /// Files in progress, by index.
     active: Vec<Active>,
     /// The selected file in progress, by index.
@@ -494,7 +496,7 @@ impl App {
             Item::Recursive => toggle(o.recursive, "Include subfolders".into()),
             Item::Gifsicle => toggle(o.gifsicle, "Use gifsicle".into()),
             Item::Log => toggle(o.log, format!("Write {LOG_FILE}")),
-            Item::Force => toggle(o.force, "Redo up-to-date GIFs".into()),
+            Item::Force => toggle(o.force, "Redo optimized GIFs".into()),
             // The spans at index 1 and 3 are the -/+ buttons; see `draw_settings`.
             Item::Jobs => vec![
                 Span::from("    Parallel jobs: "),
@@ -657,8 +659,11 @@ impl App {
                 "Append everything shown during the run to {LOG_FILE} next to the executable."
             ),
             Item::Force => format!(
-                "Process every GIF again. When off, a GIF is skipped if {OUTPUT_DIR}/ already \
-                 has a result that is newer than the GIF."
+                "Process every GIF again. When off, a GIF is skipped if it is already \
+                 optimized (it has the program's marker, or is listed in {}), or if \
+                 {OUTPUT_DIR}/ has a result newer than it. A GIF optimized with Exact on is \
+                 still processed when Exact is off.",
+                crate::record::DONE_FILE
             ),
             Item::Jobs => format!(
                 "How many GIFs to process at the same time. Use ←/→ or click -/+ to change. \
@@ -684,6 +689,7 @@ impl RunView {
             stopped: 0,
             excluded: 0,
             not_gifs: 0,
+            already: 0,
             active: Vec::new(),
             selected: None,
             confirm: None,
@@ -756,6 +762,10 @@ impl RunView {
                         FileResult::NotGif => {
                             self.done += 1;
                             self.not_gifs += 1;
+                        }
+                        FileResult::AlreadyDone => {
+                            self.done += 1;
+                            self.already += 1;
                         }
                     }
                 }
@@ -909,6 +919,9 @@ impl RunView {
         }
         if self.not_gifs > 0 {
             label += &format!(", {} not GIFs", self.not_gifs);
+        }
+        if self.already > 0 {
+            label += &format!(", {} already optimized", self.already);
         }
         let (title, style) = match self.finished {
             None => (" Running ", Style::new().cyan()),

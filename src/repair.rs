@@ -175,7 +175,7 @@ fn find_cut(d: &[u8]) -> Option<(usize, Repair)> {
 }
 
 /// Size of the color table announced by a packed flags byte.
-fn color_table_len(flags: u8) -> usize {
+pub(crate) fn color_table_len(flags: u8) -> usize {
     if flags & 0x80 == 0 {
         0
     } else {
@@ -185,7 +185,7 @@ fn color_table_len(flags: u8) -> usize {
 
 /// The position after the sub-blocks starting at `p` and their
 /// terminator, or `None` if the data ends first.
-fn skip_sub_blocks(d: &[u8], mut p: usize) -> Option<usize> {
+pub(crate) fn skip_sub_blocks(d: &[u8], mut p: usize) -> Option<usize> {
     loop {
         let len = usize::from(*d.get(p)?);
         if len == 0 {

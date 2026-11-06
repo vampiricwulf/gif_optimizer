@@ -41,6 +41,8 @@ pub enum FileResult {
     Excluded,
     /// Skipped because the file is not a GIF.
     NotGif,
+    /// Skipped because the record recognized its content as optimized.
+    AlreadyDone,
     Failed,
 }
 
@@ -175,9 +177,42 @@ fn format_utc(secs: u64) -> String {
     )
 }
 
+/// Seconds since the Unix epoch from `YYYY-MM-DD HH:MM:SS` (UTC), the
+/// format of `format_utc`.
+pub fn parse_utc(text: &str) -> Option<u64> {
+    let b = text.as_bytes();
+    if b.len() != 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b' ' {
+        return None;
+    }
+    let num = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hh, mm, ss) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // Days since 1970-01-01 from a civil date (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hh * 3600 + mm * 60 + ss).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_what_it_formats() {
+        for secs in [0, 951_782_400, 1_709_251_199, 1_793_934_146, 4_102_444_800] {
+            assert_eq!(parse_utc(&format_utc(secs)), Some(secs));
+        }
+        assert_eq!(parse_utc("2026-13-01 00:00:00"), None);
+        assert_eq!(parse_utc("2026-11-06T05:02:26"), None);
+    }
 
     #[test]
     fn formats_utc_dates() {

@@ -16,6 +16,8 @@
 //!
 //! Output:  `<input folder>/gif_optimized/<relative path>.gif`, skipped
 //!          when it is already newer than its source (unless `--force`)
+//! Done:    `<exe dir>/gif_optimizer.done`, plus a marker in every written
+//!          GIF, so already optimized GIFs are skipped (see `record`)
 //! Temp:    `<exe dir>/gif_optimizing/` (removed when everything succeeds)
 //! Original GIFs are never modified or deleted, unless `--replace` is given:
 //! then each original is overwritten in place, keeping its modified time,
@@ -28,9 +30,11 @@
 
 mod composite;
 mod encode;
+mod import;
 mod lzw;
 mod output;
 mod progress;
+mod record;
 mod repair;
 mod similar;
 mod store;
@@ -50,6 +54,7 @@ use composite::composite_frames;
 use lzw::Effort;
 use output::{Event, FileResult, Kind, Output, Sink};
 use progress::{cancelled, Cancelled, Control, Progress, Stage};
+use record::{AlreadyOptimized, Mode, Record};
 use store::FrameStore;
 use timeline::{collapse_repeats, merge_consecutive, TimelineFrame};
 
@@ -66,7 +71,12 @@ files and folders can also be dropped onto the executable. Started without
 arguments in a terminal, an interactive screen opens instead.
 
 Results are written to a gif_optimized folder next to each input. A GIF whose
-result there is already newer than the GIF itself is skipped.
+result there is already newer than the GIF itself is skipped. So is a GIF that
+is already optimized: every GIF written gets a small marker, and finished
+files are listed in gif_optimizer.done next to the executable.
+
+A GIF finished with merging only pixel-identical frames is processed again by
+a run that may merge look-alike frames, since that may shrink it further.
 
 By default, frames that differ only by dithering noise are merged too: the
 result looks the same but may not be pixel-identical.
@@ -77,7 +87,11 @@ Options:
                   their modified time. Lossless unless --lossy is given.
   --lossy         With --replace, also merge frames that only look identical
   --recursive     Also process GIFs in subfolders
-  --force         Process GIFs again even if their result is up to date
+  --force         Process GIFs again even if already optimized or up to date
+  --import-log=FILE
+                  Instead of optimizing, add the GIFs a previous run reported
+                  in FILE (a gif_optimizer.log) to gif_optimizer.done, if they
+                  still match. For results moved over their originals.
   --no-gifsicle   Do not try gifsicle -O3 on the results
   --jobs=N        Process N GIFs at a time (default: 4)
   --log           Append all output to gif_optimizer.log next to the executable
@@ -100,6 +114,8 @@ struct Report {
     used_gifsicle: bool,
     /// How the source was repaired before optimizing, if it was damaged.
     repair: Option<repair::Repair>,
+    /// Size and hash of the file now at the destination, for the record.
+    written: (u64, u64),
 }
 
 #[derive(Clone)]
@@ -120,6 +136,9 @@ struct Options {
     force: bool,
     /// Files and folders to process instead of the executable's directory.
     paths: Vec<PathBuf>,
+    /// The record of optimized files; `record::DONE_FILE` next to the
+    /// executable if not given.
+    done_file: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -134,6 +153,7 @@ impl Default for Options {
             log: false,
             force: false,
             paths: Vec::new(),
+            done_file: None,
         }
     }
 }
@@ -154,6 +174,21 @@ impl Options {
     /// original cannot be undone, so it is lossless unless asked otherwise.
     fn lossless(&self) -> bool {
         self.exact || (self.replace && !self.lossy)
+    }
+
+    fn mode(&self) -> Mode {
+        if self.lossless() {
+            Mode::Lossless
+        } else {
+            Mode::Lossy
+        }
+    }
+
+    fn done_file(&self) -> Result<PathBuf> {
+        match &self.done_file {
+            Some(path) => Ok(path.clone()),
+            None => Ok(base_dir()?.join(record::DONE_FILE)),
+        }
     }
 
     /// The command line that runs with these options, for the log header.
@@ -183,6 +218,7 @@ impl Options {
 
 enum Command {
     Run { options: Options, pause: bool },
+    Import { log: PathBuf, pause: bool },
     Help,
 }
 
@@ -190,6 +226,7 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
     let mut options = Options::default();
     let mut pause = true;
     let mut flags_done = false;
+    let mut import = None;
     for arg in args {
         // Anything that is not an option (including non-UTF-8 names) is a path.
         let flag = arg.to_str().filter(|a| !flags_done && a.starts_with('-'));
@@ -211,6 +248,13 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
             "--force" => options.force = true,
             "--log" => options.log = true,
             "--no-pause" => pause = false,
+            _ if flag.starts_with("--import-log=") => {
+                let log = &flag["--import-log=".len()..];
+                if log.is_empty() {
+                    return Err("--import-log needs a log file".to_string());
+                }
+                import = Some(PathBuf::from(log));
+            }
             _ => match flag.strip_prefix("--jobs=") {
                 Some(n) => {
                     options.jobs = n.parse().ok().filter(|&n| n > 0).ok_or_else(|| {
@@ -220,6 +264,12 @@ fn parse_args(args: &[OsString]) -> Result<Command, String> {
                 None => return Err(format!("unknown option {flag}")),
             },
         }
+    }
+    if let Some(log) = import {
+        if !options.paths.is_empty() {
+            return Err("--import-log does not take other paths".to_string());
+        }
+        return Ok(Command::Import { log, pause });
     }
     if options.exact && options.lossy {
         return Err("--exact and --lossy cannot be combined".to_string());
@@ -240,6 +290,23 @@ fn main() {
     }
     let (options, pause) = match parse_args(&args) {
         Ok(Command::Run { options, pause }) => (options, pause),
+        Ok(Command::Import { log, pause }) => {
+            let out = Output::new(Sink::Console);
+            let ok = match Options::default()
+                .done_file()
+                .and_then(|done| import::import_log(&log, &done, &out))
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    out.error(format!("Error: {e:#}"));
+                    false
+                }
+            };
+            if pause {
+                wait_for_enter();
+            }
+            std::process::exit(i32::from(!ok));
+        }
         Ok(Command::Help) => {
             print!("{HELP}");
             std::process::exit(0);
@@ -301,6 +368,8 @@ struct Tally {
     errors: usize,
     stopped: usize,
     excluded: usize,
+    /// Files the record recognized by content once read.
+    already: usize,
     /// Names of files that turned out not to be GIFs.
     not_gifs: Vec<String>,
     bytes_in: u64,
@@ -313,6 +382,7 @@ impl Tally {
             errors: self.errors + o.errors,
             stopped: self.stopped + o.stopped,
             excluded: self.excluded + o.excluded,
+            already: self.already + o.already,
             not_gifs: [self.not_gifs, o.not_gifs].concat(),
             bytes_in: self.bytes_in + o.bytes_in,
             bytes_out: self.bytes_out + o.bytes_out,
@@ -443,10 +513,28 @@ fn run(options: &Options, out: &Output, control: &Control) -> Result<bool> {
     });
     let (mut jobs, problems) = collect_jobs(options, &base_dir, &work_root, out)?;
     let found = jobs.len();
+    let done_file = options.done_file()?;
+    let record = match Record::open(&done_file) {
+        Ok(record) => Some(record),
+        Err(e) => {
+            out.error(format!(
+                "Cannot use {}: {e}; already optimized GIFs are only recognized by their marker.",
+                done_file.display()
+            ));
+            None
+        }
+    };
+    let mode = options.mode();
     if !options.force && !options.replace {
         jobs.retain(|j| !j.up_to_date());
     }
     let up_to_date = found - jobs.len();
+    if !options.force {
+        let done = already_optimized(&jobs, record.as_ref(), mode);
+        let mut flags = done.iter();
+        jobs.retain(|_| !flags.next().copied().unwrap_or(false));
+    }
+    let already = found - up_to_date - jobs.len();
     out.event(Event::Started { total: jobs.len() });
     if found == 0 {
         out.line("No GIF files found.");
@@ -457,6 +545,11 @@ fn run(options: &Options, out: &Output, control: &Control) -> Result<bool> {
         out.line(format!(
             "Skipping {up_to_date} with an up-to-date result in {OUTPUT_DIR}; \
              use --force to process them again."
+        ));
+    }
+    if already > 0 {
+        out.line(format!(
+            "Skipping {already} already optimized; use --force to process them again."
         ));
     }
     if jobs.is_empty() {
@@ -530,6 +623,7 @@ fn run(options: &Options, out: &Output, control: &Control) -> Result<bool> {
                             &work_dir,
                             options.lossless(),
                             use_gifsicle,
+                            record.as_ref().filter(|_| !options.force),
                             &progress,
                         );
                         let header = (
@@ -540,8 +634,25 @@ fn run(options: &Options, out: &Output, control: &Control) -> Result<bool> {
                             Ok(r) => {
                                 t.bytes_in += r.original_size;
                                 t.bytes_out += r.output_size;
-                                out.block([vec![header], describe(&r, started)].concat());
+                                let mut lines = [vec![header], describe(&r, started)].concat();
+                                if let Some(record) = &record {
+                                    if let Err(e) = remember(record, &job.dest, r.written, mode) {
+                                        lines.push((
+                                            Kind::Warning,
+                                            format!("    not added to {}: {e}", record::DONE_FILE),
+                                        ));
+                                    }
+                                }
+                                out.block(lines);
                                 FileResult::Done(r.original_size, r.output_size)
+                            }
+                            Err(e) if e.downcast_ref::<AlreadyOptimized>().is_some() => {
+                                t.already += 1;
+                                out.block(vec![
+                                    header,
+                                    (Kind::Detail, format!("    skipped: {e}")),
+                                ]);
+                                FileResult::AlreadyDone
                             }
                             Err(e) if cancelled(&e).is_some() => {
                                 // A partial result is of no use for a later run.
@@ -601,12 +712,18 @@ fn run(options: &Options, out: &Output, control: &Control) -> Result<bool> {
         errors,
         stopped,
         excluded,
+        already: recognized,
         mut not_gifs,
         bytes_in: total_in,
         bytes_out: total_out,
     } = tally;
 
     out.line("");
+    if recognized > 0 {
+        out.line(format!(
+            "Skipped {recognized} GIF(s) recognized as already optimized by their content."
+        ));
+    }
     if !not_gifs.is_empty() {
         not_gifs.sort();
         let mut lines = vec![(
@@ -671,6 +788,41 @@ fn run(options: &Options, out: &Output, control: &Control) -> Result<bool> {
         ));
     }
     Ok(errors == 0 && problems == 0)
+}
+
+/// For each job, whether it is already optimized in a mode that covers
+/// `mode`: either the record knows it unchanged, or it has a marker. Only
+/// metadata and the start of each file are read, in parallel.
+fn already_optimized(jobs: &[Job], record: Option<&Record>, mode: Mode) -> Vec<bool> {
+    let check = |job: &Job| {
+        let Ok(meta) = fs::metadata(&job.src) else {
+            return false;
+        };
+        record.is_some_and(|r| r.knows_file(&job.src, &meta, mode))
+            || record::file_marker(&job.src).is_some_and(|m| m.covers(mode))
+    };
+    let check = &check;
+    // Opening many files is slow on hard drives, but overlaps well.
+    let chunk = jobs.len().div_ceil(16).max(1);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = jobs
+            .chunks(chunk)
+            .map(|part| s.spawn(move || part.iter().map(check).collect::<Vec<_>>()))
+            .collect();
+        handles.into_iter().flat_map(join).collect()
+    })
+}
+
+/// Adds the file now at `path`, with the given size and hash, to `record`.
+fn remember(record: &Record, path: &Path, (size, hash): (u64, u64), mode: Mode) -> io::Result<()> {
+    let meta = fs::metadata(path)?;
+    record.add(record::Entry {
+        hash,
+        size,
+        mode,
+        modified: record::modified_ns(&meta),
+        path: path.to_path_buf(),
+    })
 }
 
 /// The per-file report lines, without the header.
@@ -885,19 +1037,27 @@ fn run_gifsicle(input: &Path, output: &Path, progress: &Progress) -> Result<Opti
 /// Optimizes `src` and writes the result to `dest`, which may be `src`
 /// itself. If the result is not smaller, the original is copied to `dest`.
 /// Fails with a `Cancelled` error as soon as `progress` reports that the
-/// file was cancelled; `dest` is then left untouched.
+/// file was cancelled; `dest` is then left untouched. Fails with
+/// `AlreadyOptimized` if `known` lists its content as done in a mode that
+/// covers this run's. Everything written gets a marker (see `record`).
 fn process_gif(
     src: &Path,
     dest: &Path,
     work_dir: &Path,
     exact: bool,
     use_gifsicle: bool,
+    known: Option<&Record>,
     progress: &Progress,
 ) -> Result<Report> {
+    let mode = if exact { Mode::Lossless } else { Mode::Lossy };
     progress.stage(Stage::Reading)?;
     let original = fs::read(src).with_context(|| format!("cannot read {}", src.display()))?;
     if let Some(not_gif) = repair::not_gif(&original) {
         return Err(not_gif.into());
+    }
+    let original_hash = record::hash(&original);
+    if known.is_some_and(|r| r.knows_content(original.len() as u64, original_hash, mode)) {
+        return Err(AlreadyOptimized.into());
     }
     if work_dir.exists() {
         fs::remove_dir_all(work_dir)?;
@@ -1031,25 +1191,39 @@ fn process_gif(
     }
     // A repaired source is written even if the result is not smaller than
     // the original, which is broken; the repaired file itself is the
-    // fallback.
-    let (output_size, kept_original) = match encoded {
-        Ok(bytes) if bytes.len() < source.len() => {
+    // fallback. The marker counts towards the size, so a result is only
+    // used if it is smaller including it. An original that is kept as it
+    // is gets no marker, which would make it larger; the record covers it.
+    let marked = |bytes: &[u8]| match record::read_marker(bytes) {
+        Some(_) => bytes.to_vec(),
+        None => record::add_marker(bytes, mode),
+    };
+    let (written, kept_original) = match encoded {
+        Ok(bytes) if bytes.len() + record::MARKER_LEN < source.len() => {
+            let bytes = record::add_marker(&bytes, mode);
             write_atomically(dest, &bytes, modified)?;
-            (bytes.len() as u64, None)
+            ((bytes.len() as u64, record::hash(&bytes)), None)
         }
         other => {
             let reason = match other {
                 Ok(_) => "re-encoded version was not smaller".to_string(),
                 Err(e) => format!("could not re-encode losslessly ({e:#})"),
             };
-            if repair.is_some() {
-                write_atomically(dest, &source, modified)?;
-            } else if dest != src {
-                fs::copy(src, dest).with_context(|| format!("cannot write {}", dest.display()))?;
-            }
-            (source.len() as u64, Some(reason))
+            let written = if repair.is_some() {
+                let bytes = marked(&source);
+                write_atomically(dest, &bytes, modified)?;
+                (bytes.len() as u64, record::hash(&bytes))
+            } else {
+                if dest != src {
+                    fs::copy(src, dest)
+                        .with_context(|| format!("cannot write {}", dest.display()))?;
+                }
+                (original_size, original_hash)
+            };
+            (written, Some(reason))
         }
     };
+    let output_size = written.0;
 
     let report = Report {
         original_frames: raw.len(),
@@ -1062,6 +1236,7 @@ fn process_gif(
         kept_original,
         used_gifsicle,
         repair,
+        written,
     };
 
     drop(store);
@@ -1256,6 +1431,10 @@ mod tests {
     static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn run_alone(options: &Options, out: &Output, control: &Control) -> Result<bool> {
+        assert!(
+            options.done_file.is_some(),
+            "tests must not share the record next to the test executable"
+        );
         let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         run(options, out, control)
     }
@@ -1267,6 +1446,7 @@ mod tests {
             work_dir,
             exact,
             false,
+            None,
             &Progress::silent(&NEVER, src),
         )
     }
@@ -1601,6 +1781,7 @@ mod tests {
         let options = Options {
             gifsicle: false,
             paths: vec![root.clone()],
+            done_file: Some(root.join("done.txt")),
             ..Options::default()
         };
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1636,6 +1817,122 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Runs `options` and returns whether it succeeded, its text, and how
+    /// each file ended.
+    fn run_collect(options: &Options) -> (bool, String, Vec<FileResult>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ok = run_alone(options, &Output::new(Sink::Channel(tx)), &Control::new()).unwrap();
+        let (mut text, mut results) = (Vec::new(), Vec::new());
+        for e in rx.try_iter() {
+            match e {
+                Event::Text(lines) => text.extend(lines.into_iter().map(|l| l.1)),
+                Event::FileDone { result, .. } => results.push(result),
+                _ => {}
+            }
+        }
+        (ok, text.join("\n"), results)
+    }
+
+    #[test]
+    fn optimized_gifs_are_not_redone() {
+        let root = std::env::temp_dir().join("gif_optimizer_test_redo");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let done = root.join("done.txt");
+        let src = root.join("a.gif");
+        write_gif(&src, &[1, 2, 3, 1, 2, 3], Repeat::Infinite, false);
+        let opts = |exact: bool, force: bool| Options {
+            exact,
+            force,
+            gifsicle: false,
+            jobs: 1,
+            paths: vec![root.clone()],
+            done_file: Some(done.clone()),
+            ..Options::default()
+        };
+        let out_dir = root.join(OUTPUT_DIR);
+        let skipped = "Skipping 1 already optimized";
+
+        // A lossless run writes a marked result, which the user then moves
+        // over the original.
+        let (ok, text, _) = run_collect(&opts(true, false));
+        assert!(ok, "{text}");
+        let result = out_dir.join("a.gif");
+        assert_eq!(record::file_marker(&result), Some(Mode::Lossless));
+        fs::copy(&result, &src).unwrap();
+        fs::remove_dir_all(&out_dir).unwrap();
+
+        let (_, text, results) = run_collect(&opts(true, false));
+        assert!(text.contains(skipped) && results.is_empty(), "{text}");
+        let (_, text, _) = run_collect(&opts(true, true));
+        assert!(
+            !text.contains(skipped) && out_dir.join("a.gif").exists(),
+            "{text}"
+        );
+        fs::remove_dir_all(&out_dir).unwrap();
+        // A lossless result may still shrink when look-alikes may merge.
+        let (_, text, results) = run_collect(&opts(false, false));
+        assert!(!text.contains(skipped), "{text}");
+        assert!(matches!(results[..], [FileResult::Done(..)]), "{results:?}");
+        fs::remove_dir_all(&out_dir).unwrap();
+        fs::remove_file(&src).unwrap();
+
+        // A file the record knows by content, even at another path and
+        // without a marker, is recognized once read.
+        let plain = root.join("plain.gif");
+        write_gif(&plain, &[4, 5], Repeat::Infinite, false);
+        let data = fs::read(&plain).unwrap();
+        Record::open(&done)
+            .unwrap()
+            .add(record::Entry {
+                hash: record::hash(&data),
+                size: data.len() as u64,
+                mode: Mode::Lossy,
+                modified: None,
+                path: root.join("elsewhere.gif"),
+            })
+            .unwrap();
+        let (ok, text, results) = run_collect(&opts(false, false));
+        assert!(ok, "{text}");
+        assert_eq!(results, [FileResult::AlreadyDone]);
+        assert!(text.contains("already optimized (recognized by its content)"));
+        assert!(!out_dir.join("plain.gif").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn replaced_gifs_are_not_redone() {
+        let root = std::env::temp_dir().join("gif_optimizer_test_redo_replace");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let src = root.join("r.gif");
+        write_gif(&src, &[1, 1, 2, 2, 1, 1, 2, 2], Repeat::Infinite, false);
+        let options = Options {
+            replace: true,
+            gifsicle: false,
+            jobs: 1,
+            paths: vec![root.clone()],
+            done_file: Some(root.join("done.txt")),
+            ..Options::default()
+        };
+        let (ok, text, results) = run_collect(&options);
+        assert!(
+            ok && matches!(results[..], [FileResult::Done(..)]),
+            "{text}"
+        );
+        let after = fs::read(&src).unwrap();
+        assert_eq!(record::read_marker(&after), Some(Mode::Lossless));
+
+        // Recognized by the record, and by the marker alone.
+        let (_, text, results) = run_collect(&options);
+        assert!(text.contains("Skipping 1 already optimized") && results.is_empty());
+        fs::remove_file(root.join("done.txt")).unwrap();
+        let (_, text, _) = run_collect(&options);
+        assert!(text.contains("Skipping 1 already optimized"), "{text}");
+        assert_eq!(fs::read(&src).unwrap(), after);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn excluded_folders_are_skipped() {
         let root = std::env::temp_dir().join("gif_optimizer_test_exclude");
@@ -1649,6 +1946,7 @@ mod tests {
             gifsicle: false,
             jobs: 1,
             paths: vec![root.clone()],
+            done_file: Some(root.join("done.txt")),
             ..Options::default()
         };
         let control = Control::new();
@@ -1687,7 +1985,15 @@ mod tests {
         control.stop();
         let progress = Progress::silent(&control, &src);
         for dest in [root.join("out.gif"), src.clone()] {
-            let result = process_gif(&src, &dest, &root.join("work"), false, false, &progress);
+            let result = process_gif(
+                &src,
+                &dest,
+                &root.join("work"),
+                false,
+                false,
+                None,
+                &progress,
+            );
             let e = result.err().expect("a stopped file must fail");
             assert_eq!(cancelled(&e), Some(Cancelled::Stopped), "{e:#}");
         }
