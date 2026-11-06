@@ -1,6 +1,6 @@
 [package]
 name = "gif_optimizer"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Losslessly removes redundant frames from GIFs in the executable's directory"
 
