@@ -12,7 +12,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Flex, Layout, Position, Rect};
-use ratatui::style::{Style, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Gauge, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
@@ -43,6 +43,9 @@ const ITEMS: [Item; 7] = [
     Item::Run,
 ];
 const RUN: usize = ITEMS.len() - 1;
+/// A faint background for the selected row, from the 256-color palette so
+/// it does not depend on how the theme maps the 16 basic colors.
+const SELECTED_BG: Color = Color::Indexed(237);
 
 /// A clickable region from the last draw: clicking it selects `select`
 /// (if any) and then acts as if `key` was pressed.
@@ -401,6 +404,7 @@ impl App {
         let block = Block::bordered().title(" Options ".bold());
         let inner = block.inner(list);
         let mut lines = Vec::new();
+        let mut selected_row = Rect::default();
         for (i, &item) in ITEMS.iter().enumerate() {
             let spans = self.item_spans(item);
             let y = inner.y.saturating_add(i as u16);
@@ -433,14 +437,23 @@ impl App {
                     x = x.saturating_add(width);
                 }
             }
-            let line = Line::from([vec![Span::from(" ")], spans].concat());
+            // The marker must stay one column wide; the jobs buttons'
+            // click areas above assume it.
             lines.push(if i == self.selected {
-                line.on_dark_gray()
+                let spans = spans
+                    .into_iter()
+                    .map(|s| if s.style.fg.is_none() { s.cyan() } else { s });
+                selected_row = row;
+                Line::from([vec![Span::from("▶").cyan()], spans.collect()].concat()).bold()
             } else {
-                line
+                Line::from([vec![Span::from(" ")], spans].concat())
             });
         }
         frame.render_widget(Paragraph::new(lines).block(block), list);
+        // Fill the whole row, not just its text; only the background changes.
+        frame
+            .buffer_mut()
+            .set_style(selected_row, Style::new().bg(SELECTED_BG));
 
         let item = ITEMS[self.selected];
         let help_text = Paragraph::new(self.help(item)).wrap(Wrap { trim: true });
@@ -851,6 +864,22 @@ mod tests {
     }
 
     #[test]
+    fn selected_row_has_marker_and_faint_background() {
+        let mut app = App::new();
+        app.options.exact = true;
+        app.selected = 0;
+        let (x, y) = find(&mut app, "▶");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row_bg = |cx: u16| buffer[(cx, y)].bg;
+        assert_eq!((row_bg(x), row_bg(77)), (SELECTED_BG, SELECTED_BG));
+        assert_eq!(buffer[(x + 1, y)].fg, Color::Green, "[x] keeps its color");
+        assert_eq!(buffer[(x + 5, y)].fg, Color::Cyan, "label turns cyan");
+        assert_ne!(buffer[(x, y + 1)].bg, SELECTED_BG);
+    }
+
+    #[test]
     fn wheel_scrolls_the_run_log() {
         let (tx, rx) = mpsc::channel();
         let mut app = App::new();
@@ -873,7 +902,6 @@ mod tests {
 
     #[test]
     fn log_lines_are_colored_by_meaning() {
-        use ratatui::style::Color;
         let fg = |text, error| log_style(text, error).fg;
         assert_eq!(fg("[1/2] a.gif", false), Some(Color::Cyan));
         assert_eq!(fg("    size:   1 KB -> 0 KB", false), Some(Color::Green));
