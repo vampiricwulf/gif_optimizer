@@ -3,7 +3,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,6 +37,8 @@ pub enum FileResult {
     Done(u64, u64),
     /// Cancelled by a stop request.
     Stopped,
+    /// Skipped or cancelled because its folder was excluded.
+    Excluded,
     Failed,
 }
 
@@ -49,10 +51,12 @@ pub enum Event {
     Started {
         total: usize,
     },
-    /// Work on a file has begun.
+    /// Work on a file has begun. `folders` are the folders that can be
+    /// excluded to skip it, deepest first, with their display names.
     FileStarted {
         index: usize,
         name: String,
+        folders: Vec<(PathBuf, String)>,
     },
     /// Progress within a file; `total` is 0 while it is unknown.
     Progress {

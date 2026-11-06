@@ -1,9 +1,9 @@
 //! Interactive screen shown when the program starts without arguments:
 //! pick the options, run, and watch the progress.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use ratatui::crossterm::event::{
@@ -18,7 +18,7 @@ use ratatui::widgets::{Block, Clear, Gauge, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::output::{Event, FileResult, Kind, Output, Sink};
-use crate::progress::Stage;
+use crate::progress::{Control, Stage};
 use crate::{format_size, Options, LOG_FILE, OUTPUT_DIR, WORK_DIR};
 
 const MAX_JOBS: usize = 64;
@@ -50,12 +50,14 @@ const RUN: usize = ITEMS.len() - 1;
 /// it does not depend on how the theme maps the 16 basic colors.
 const SELECTED_BG: Color = Color::Indexed(237);
 
-/// A clickable region from the last draw: clicking it selects `select`
-/// (if any) and then acts as if `key` was pressed.
-#[derive(Clone, Copy)]
+/// A clickable region from the last draw: clicking it selects the option
+/// `select` or the file in progress `file` (if any), and then acts as if
+/// `key` was pressed.
+#[derive(Clone, Copy, Default)]
 struct Hit {
     area: Rect,
     select: Option<usize>,
+    file: Option<usize>,
     key: Option<KeyCode>,
 }
 
@@ -85,9 +87,19 @@ impl Drop for MouseCapture {
 struct Active {
     index: usize,
     name: String,
+    /// Folders that can be excluded to skip it, deepest first.
+    folders: Vec<(PathBuf, String)>,
     stage: Stage,
     done: usize,
     total: usize,
+}
+
+/// Asking to confirm that a folder should be skipped.
+struct Exclude {
+    /// The choices, deepest first, with their names.
+    folders: Vec<(PathBuf, String)>,
+    /// Which of `folders` is chosen.
+    level: usize,
 }
 
 impl Active {
@@ -122,7 +134,10 @@ impl Active {
 /// A run in progress or just finished.
 struct RunView {
     rx: Receiver<Event>,
-    stop: Arc<AtomicBool>,
+    control: Arc<Control>,
+    /// The run's output, to report exclusions in the log too. Weak, so the
+    /// channel still disconnects if the run thread dies.
+    out: Weak<Output>,
     lines: Vec<(Kind, String)>,
     total: Option<usize>,
     /// Files that finished, successfully or not.
@@ -130,8 +145,13 @@ struct RunView {
     failed: usize,
     /// Files cancelled by a stop request.
     stopped: usize,
+    /// Files skipped or cancelled because their folder was excluded.
+    excluded: usize,
     /// Files in progress, by index.
     active: Vec<Active>,
+    /// The selected file in progress, by index.
+    selected: Option<usize>,
+    confirm: Option<Exclude>,
     bytes_in: u64,
     bytes_out: u64,
     /// `Some(ok)` once the run is over.
@@ -212,9 +232,23 @@ impl App {
 
     fn on_key(&mut self, key: KeyCode) {
         if let Some(run) = &mut self.run {
-            if run.finished.is_none() {
+            if let Some(confirm) = &mut run.confirm {
                 match key {
-                    KeyCode::Char('q') | KeyCode::Esc => run.stop.store(true, Ordering::Relaxed),
+                    KeyCode::Char('y' | 'Y') => run.exclude(),
+                    KeyCode::Left => {
+                        confirm.level = (confirm.level + 1).min(confirm.folders.len() - 1);
+                    }
+                    KeyCode::Right => confirm.level = confirm.level.saturating_sub(1),
+                    _ => run.confirm = None,
+                }
+            } else if run.finished.is_none() {
+                match key {
+                    KeyCode::Char('q') => run.control.stop(),
+                    KeyCode::Esc if run.selected.is_some() => run.selected = None,
+                    KeyCode::Esc => run.control.stop(),
+                    KeyCode::Tab => run.select_step(1),
+                    KeyCode::BackTab => run.select_step(-1),
+                    KeyCode::Char('x') | KeyCode::Enter => run.ask_exclude(),
                     _ => run.scroll_key(key),
                 }
             } else {
@@ -276,6 +310,9 @@ impl App {
                     if let Some(i) = hit.select {
                         self.selected = i;
                     }
+                    if let (Some(file), Some(run)) = (hit.file, &mut self.run) {
+                        run.selected = Some(file);
+                    }
                     if let Some(key) = hit.key {
                         self.on_key(key);
                     }
@@ -312,20 +349,24 @@ impl App {
 
     fn start(&mut self) {
         let (tx, rx) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
+        let control = Arc::new(Control::new());
         let options = self.options.clone();
-        let worker_stop = Arc::clone(&stop);
+        let mut out = Output::new(Sink::Channel(tx));
+        let log_error = if options.log {
+            crate::open_log(&mut out, &options).err()
+        } else {
+            None
+        };
+        let out = Arc::new(out);
+        let view = RunView::new(rx, Arc::clone(&control), Arc::downgrade(&out));
         std::thread::spawn(move || {
-            let mut out = Output::new(Sink::Channel(tx));
-            if options.log {
-                if let Err(e) = crate::open_log(&mut out, &options) {
-                    out.error(format!("Not logging: {e:#}"));
-                }
+            if let Some(e) = log_error {
+                out.error(format!("Not logging: {e:#}"));
             }
-            let ok = crate::run_reported(&options, &out, &worker_stop);
+            let ok = crate::run_reported(&options, &out, &control);
             out.event(Event::Finished { ok });
         });
-        self.run = Some(RunView::new(rx, stop));
+        self.run = Some(view);
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -347,13 +388,34 @@ impl App {
         let q = Some(KeyCode::Char('q'));
         let hints = match &mut self.run {
             Some(run) => {
-                run.draw(frame, body);
-                match run.finished {
-                    None if run.stop.load(Ordering::Relaxed) => {
+                run.draw(frame, body, &mut self.hits);
+                match (&run.confirm, run.finished) {
+                    (Some(confirm), _) => {
+                        let mut hints = vec![
+                            Hint::Key("y", "skip folder", None, Some(KeyCode::Char('y'))),
+                            Hint::Key("n", "cancel", None, Some(KeyCode::Char('n'))),
+                        ];
+                        if confirm.folders.len() > 1 {
+                            hints.push(Hint::Key("←→", "choose folder", None, None));
+                        }
+                        hints
+                    }
+                    (None, None) if run.control.stopped() => {
                         vec![Hint::Note("Stopping..."), SCROLL]
                     }
-                    None => vec![Hint::Key("q", "stop", None, q), SCROLL],
-                    Some(_) => vec![
+                    (None, None) if run.selected.is_some() => vec![
+                        Hint::Key("x", "skip its folder", None, Some(KeyCode::Char('x'))),
+                        Hint::Key("Tab", "next file", None, Some(KeyCode::Tab)),
+                        Hint::Key("Esc", "unselect", None, Some(KeyCode::Esc)),
+                        Hint::Key("q", "stop", None, q),
+                        SCROLL,
+                    ],
+                    (None, None) => vec![
+                        Hint::Key("q", "stop", None, q),
+                        Hint::Key("Tab/click", "select a file", None, Some(KeyCode::Tab)),
+                        SCROLL,
+                    ],
+                    (None, Some(_)) => vec![
                         Hint::Key("Enter", "back to options", None, Some(KeyCode::Enter)),
                         Hint::Key("q", "quit", None, q),
                         SCROLL,
@@ -396,6 +458,7 @@ impl App {
                             area: Rect::new(x, area.y, width, 1).intersection(area),
                             select,
                             key: code,
+                            ..Hit::default()
                         });
                     }
                 }
@@ -461,6 +524,7 @@ impl App {
                 _ => Some(KeyCode::Char(' ')),
             };
             self.hits.push(Hit {
+                file: None,
                 area: row,
                 select: Some(i),
                 key,
@@ -473,6 +537,7 @@ impl App {
                         self.hits.push(Hit {
                             area: Rect::new(x, y, width, 1).intersection(row),
                             select: Some(i),
+                            file: None,
                             key: Some(if k == 1 {
                                 KeyCode::Left
                             } else {
@@ -525,8 +590,8 @@ impl App {
         // Clicking anywhere outside the buttons cancels.
         self.hits.push(Hit {
             area,
-            select: None,
             key: Some(KeyCode::Char('n')),
+            ..Hit::default()
         });
         let popup = centered(area, 56, 6);
         let block = Block::bordered()
@@ -558,8 +623,8 @@ impl App {
         frame.render_widget(no, no_area);
         self.hits.push(Hit {
             area: yes_area,
-            select: None,
             key: Some(KeyCode::Char('y')),
+            ..Hit::default()
         });
     }
 
@@ -605,16 +670,20 @@ impl App {
 }
 
 impl RunView {
-    fn new(rx: Receiver<Event>, stop: Arc<AtomicBool>) -> Self {
+    fn new(rx: Receiver<Event>, control: Arc<Control>, out: Weak<Output>) -> Self {
         Self {
             rx,
-            stop,
+            control,
+            out,
             lines: Vec::new(),
             total: None,
             done: 0,
             failed: 0,
             stopped: 0,
+            excluded: 0,
             active: Vec::new(),
+            selected: None,
+            confirm: None,
             bytes_in: 0,
             bytes_out: 0,
             finished: None,
@@ -636,13 +705,18 @@ impl RunView {
                     }
                 }
                 Ok(Event::Started { total }) => self.total = Some(total),
-                Ok(Event::FileStarted { index, name }) => {
+                Ok(Event::FileStarted {
+                    index,
+                    name,
+                    folders,
+                }) => {
                     let at = self.active.partition_point(|a| a.index < index);
                     self.active.insert(
                         at,
                         Active {
                             index,
                             name,
+                            folders,
                             stage: Stage::Reading,
                             done: 0,
                             total: 0,
@@ -661,6 +735,9 @@ impl RunView {
                 }
                 Ok(Event::FileDone { index, result }) => {
                     self.active.retain(|a| a.index != index);
+                    if self.selected == Some(index) {
+                        self.selected = None;
+                    }
                     match result {
                         FileResult::Done(a, b) => {
                             self.done += 1;
@@ -672,9 +749,14 @@ impl RunView {
                             self.failed += 1;
                         }
                         FileResult::Stopped => self.stopped += 1,
+                        FileResult::Excluded => self.excluded += 1,
                     }
                 }
-                Ok(Event::Finished { ok }) => self.finished = Some(ok),
+                Ok(Event::Finished { ok }) => {
+                    self.finished = Some(ok);
+                    // Nothing is left to exclude.
+                    (self.selected, self.confirm) = (None, None);
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     if self.finished.is_none() {
@@ -683,9 +765,68 @@ impl RunView {
                         self.finished = Some(false);
                     }
                     self.active.clear();
+                    (self.selected, self.confirm) = (None, None);
                     break;
                 }
             }
+        }
+    }
+
+    /// Moves the selection `step` files through those in progress,
+    /// wrapping around, or selects the first one.
+    fn select_step(&mut self, step: isize) {
+        let n = self.active.len();
+        if n == 0 {
+            return;
+        }
+        let at = match self.selected_position() {
+            Some(i) => (i as isize + step).rem_euclid(n as isize) as usize,
+            None => 0,
+        };
+        self.selected = Some(self.active[at].index);
+    }
+
+    fn selected_position(&self) -> Option<usize> {
+        let index = self.selected?;
+        self.active.iter().position(|a| a.index == index)
+    }
+
+    /// Asks to confirm skipping the selected file's folder.
+    fn ask_exclude(&mut self) {
+        if self.control.stopped() {
+            return;
+        }
+        let Some(a) = self.selected_position().map(|i| &self.active[i]) else {
+            return;
+        };
+        if a.folders.is_empty() {
+            let note = format!(
+                "{} is not in a subfolder, so there is no folder to skip.",
+                a.name
+            );
+            self.lines.push((Kind::Warning, note));
+            return;
+        }
+        self.confirm = Some(Exclude {
+            folders: a.folders.clone(),
+            level: 0,
+        });
+    }
+
+    /// Skips the folder chosen in the confirmation.
+    fn exclude(&mut self) {
+        let Some(Exclude { folders, level }) = self.confirm.take() else {
+            return;
+        };
+        let (dir, name) = folders.into_iter().nth(level).expect("level is in range");
+        self.control.exclude(dir);
+        self.selected = None;
+        let note = format!(
+            "Skipping folder {name}: its GIFs in progress are cancelled, the rest skipped."
+        );
+        match self.out.upgrade() {
+            Some(out) => out.say(Kind::Warning, note),
+            None => self.lines.push((Kind::Warning, note)),
         }
     }
 
@@ -696,7 +837,7 @@ impl RunView {
             Some(0) => 1.0,
             Some(total) => {
                 let partial: f64 = self.active.iter().map(Active::fraction).sum();
-                (self.done as f64 + partial) / total as f64
+                (self.done as f64 + self.excluded as f64 + partial) / total as f64
             }
         };
         ratio.clamp(0.0, 1.0)
@@ -728,7 +869,7 @@ impl RunView {
         }
     }
 
-    fn draw(&mut self, frame: &mut Frame, area: Rect) {
+    fn draw(&mut self, frame: &mut Frame, area: Rect, hits: &mut Vec<Hit>) {
         let shown = self.active.len().min(area.height as usize / 3);
         let active_height = if shown == 0 { 0 } else { shown as u16 + 2 };
         let [gauge, active, log] = Layout::vertical([
@@ -756,6 +897,9 @@ impl RunView {
         if self.stopped > 0 {
             label += &format!(", {} stopped", self.stopped);
         }
+        if self.excluded > 0 {
+            label += &format!(", {} skipped", self.excluded);
+        }
         let (title, style) = match self.finished {
             None => (" Running ", Style::new().cyan()),
             Some(true) => (" Done ", Style::new().green()),
@@ -772,26 +916,46 @@ impl RunView {
 
         if shown > 0 {
             const BAR: usize = 20;
-            let lines: Vec<Line> = self.active[..shown]
-                .iter()
-                .map(|a| {
-                    let filled = (a.fraction() * BAR as f64).round() as usize;
-                    Line::from(vec![
-                        Span::from("█".repeat(filled)).cyan(),
-                        Span::from("░".repeat(BAR - filled)).dark_gray(),
-                        Span::from(format!(" {:<18} ", a.label())).dim(),
-                        Span::from(a.name.clone()),
-                    ])
-                })
-                .collect();
-            frame.render_widget(
-                Paragraph::new(lines).block(
-                    Block::bordered()
-                        .title(" In progress ")
-                        .border_style(Style::new().dark_gray()),
-                ),
-                active,
-            );
+            let block = Block::bordered()
+                .title(" In progress ")
+                .border_style(Style::new().dark_gray());
+            let inner = block.inner(active);
+            // Scroll just enough to keep the selected file visible.
+            let first = self
+                .selected_position()
+                .map_or(0, |i| (i + 1).saturating_sub(shown));
+            let mut lines = Vec::new();
+            for (row, a) in self.active[first..first + shown].iter().enumerate() {
+                let selected = self.selected == Some(a.index);
+                let filled = (a.fraction() * BAR as f64).round() as usize;
+                let line = Line::from(vec![
+                    Span::from(if selected { "▶" } else { " " }).cyan(),
+                    Span::from("█".repeat(filled)).cyan(),
+                    Span::from("░".repeat(BAR - filled)).dark_gray(),
+                    Span::from(format!(" {:<18} ", a.label())).dim(),
+                    Span::from(a.name.clone()),
+                ]);
+                let area =
+                    Rect::new(inner.x, inner.y + row as u16, inner.width, 1).intersection(inner);
+                lines.push(line);
+                hits.push(Hit {
+                    area,
+                    file: Some(a.index),
+                    key: Some(KeyCode::Char('x')),
+                    ..Hit::default()
+                });
+            }
+            frame.render_widget(Paragraph::new(lines).block(block), active);
+            if let Some(i) = self
+                .selected_position()
+                .filter(|i| (first..first + shown).contains(i))
+            {
+                let row = Rect::new(inner.x, inner.y + (i - first) as u16, inner.width, 1)
+                    .intersection(inner);
+                frame
+                    .buffer_mut()
+                    .set_style(row, Style::new().bg(SELECTED_BG));
+            }
         }
 
         let block = Block::bordered()
@@ -807,7 +971,83 @@ impl RunView {
             .map(|(kind, text)| Line::styled(text.as_str(), log_style(*kind)))
             .collect();
         frame.render_widget(Paragraph::new(lines).block(block), log);
+
+        if let Some(confirm) = &self.confirm {
+            draw_exclude(frame, area, confirm, hits);
+        }
     }
+}
+
+/// The confirmation for skipping a folder, over `area`.
+fn draw_exclude(frame: &mut Frame, area: Rect, confirm: &Exclude, hits: &mut Vec<Hit>) {
+    // Clicking anywhere outside the buttons cancels.
+    hits.push(Hit {
+        area,
+        key: Some(KeyCode::Char('n')),
+        ..Hit::default()
+    });
+    let popup = centered(area, 64, 8);
+    let block = Block::bordered().title(" Skip folder ".bold()).yellow();
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    let [folder, text, buttons] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    // The folder, with arrows to pick a parent (◀) or subfolder (▶).
+    let (wider, narrower) = (confirm.level + 1 < confirm.folders.len(), confirm.level > 0);
+    let arrow = |s: &'static str, on: bool| {
+        if on {
+            Span::from(s).cyan().bold()
+        } else {
+            Span::from(s).dark_gray()
+        }
+    };
+    let name = Span::from(format!(" {} ", confirm.folders[confirm.level].1)).bold();
+    let name_width = name.width() as u16;
+    let line = Line::from(vec![arrow("◀", wider), name, arrow("▶", narrower)]);
+    frame.render_widget(line, folder);
+    for (x, on, key) in [
+        (folder.x, wider, KeyCode::Left),
+        (folder.x + 1 + name_width, narrower, KeyCode::Right),
+    ] {
+        if on {
+            hits.push(Hit {
+                area: Rect::new(x, folder.y, 1, 1).intersection(folder),
+                key: Some(key),
+                ..Hit::default()
+            });
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(
+            "GIFs being processed in this folder and its subfolders are cancelled, and \
+             the rest are skipped. Finished results are kept.",
+        )
+        .wrap(Wrap { trim: true }),
+        text,
+    );
+    let yes = Span::from(" Yes, skip (y) ").bold().black().on_yellow();
+    let no = Span::from(" Cancel (n) ").black().on_gray();
+    let [yes_area, _, no_area] = Layout::horizontal([
+        Constraint::Length(yes.width() as u16),
+        Constraint::Length(3),
+        Constraint::Length(no.width() as u16),
+    ])
+    .flex(Flex::Center)
+    .areas(buttons);
+    frame.render_widget(yes, yes_area);
+    frame.render_widget(no, no_area);
+    hits.push(Hit {
+        area: yes_area,
+        key: Some(KeyCode::Char('y')),
+        ..Hit::default()
+    });
 }
 
 /// Colors a line of run output by what it reports.
@@ -841,6 +1081,7 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::path::Path;
 
     fn render(app: &mut App, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -882,7 +1123,7 @@ mod tests {
     fn run_view_shows_progress_and_scrolls() {
         let (tx, rx) = mpsc::channel();
         let mut app = App::new();
-        app.run = Some(RunView::new(rx, Arc::new(AtomicBool::new(false))));
+        app.run = Some(view(rx));
         let out = Output::new(Sink::Channel(tx));
         out.event(Event::Started { total: 3 });
         for i in 0..50 {
@@ -892,6 +1133,7 @@ mod tests {
             out.event(Event::FileStarted {
                 index,
                 name: format!("file{index}.gif"),
+                folders: Vec::new(),
             });
         }
         out.event(Event::Progress {
@@ -1036,7 +1278,7 @@ mod tests {
     fn wheel_scrolls_the_run_log() {
         let (tx, rx) = mpsc::channel();
         let mut app = App::new();
-        app.run = Some(RunView::new(rx, Arc::new(AtomicBool::new(false))));
+        app.run = Some(view(rx));
         let out = Output::new(Sink::Channel(tx));
         for i in 0..50 {
             out.line(format!("line {i}"));
@@ -1050,13 +1292,103 @@ mod tests {
         assert_eq!(app.run.as_ref().unwrap().scroll, None, "back to following");
         let stop = find(&mut app, " q ");
         click(&mut app, stop);
-        assert!(app.run.as_ref().unwrap().stop.load(Ordering::Relaxed));
+        assert!(app.run.as_ref().unwrap().control.stopped());
+    }
+
+    fn view(rx: Receiver<Event>) -> RunView {
+        RunView::new(rx, Arc::new(Control::new()), Weak::new())
+    }
+
+    fn started(out: &Output, index: usize, name: &str, folders: &[(&str, &str)]) {
+        out.event(Event::FileStarted {
+            index,
+            name: name.into(),
+            folders: folders
+                .iter()
+                .map(|&(dir, name)| (PathBuf::from(dir), name.to_string()))
+                .collect(),
+        });
+    }
+
+    #[test]
+    fn files_folder_can_be_skipped_after_confirming() {
+        let (tx, rx) = mpsc::channel();
+        let out = Arc::new(Output::new(Sink::Channel(tx)));
+        let control = Arc::new(Control::new());
+        let mut app = App::new();
+        app.run = Some(RunView::new(rx, Arc::clone(&control), Arc::downgrade(&out)));
+        out.event(Event::Started { total: 5 });
+        started(&out, 0, "top.gif", &[]);
+        let folders = [("root/anims/set1", "anims/set1"), ("root/anims", "anims")];
+        started(&out, 1, "anims/set1/a.gif", &folders);
+        fn run(app: &mut App) -> &mut RunView {
+            app.run.as_mut().unwrap()
+        }
+        run(&mut app).receive();
+
+        // A top-level file has no folder to skip.
+        app.on_key(KeyCode::Tab);
+        assert_eq!(run(&mut app).selected, Some(0));
+        app.on_key(KeyCode::Char('x'));
+        assert!(run(&mut app).confirm.is_none());
+        run(&mut app).receive();
+        assert!(run(&mut app)
+            .lines
+            .last()
+            .unwrap()
+            .1
+            .contains("not in a subfolder"));
+
+        // Clicking a row selects it and asks to confirm; Esc cancels
+        // without stopping the run.
+        let row = find(&mut app, "anims/set1/a.gif");
+        click(&mut app, row);
+        assert_eq!(run(&mut app).selected, Some(1));
+        assert!(render(&mut app, 80, 24).contains("Skip folder"));
+        app.on_key(KeyCode::Esc);
+        assert!(run(&mut app).confirm.is_none() && !control.stopped());
+
+        // ← widens to the parent folder; the ◀ arrow is clickable too.
+        app.on_key(KeyCode::Char('x'));
+        app.on_key(KeyCode::Left);
+        assert!(render(&mut app, 80, 24).contains("◀ anims ▶"));
+        app.on_key(KeyCode::Right);
+        let left = find(&mut app, "◀ anims/set1");
+        click(&mut app, left);
+        assert_eq!(run(&mut app).confirm.as_ref().unwrap().level, 1);
+        let yes = find(&mut app, "Yes, skip");
+        click(&mut app, yes);
+        assert!(run(&mut app).confirm.is_none());
+        assert!(control.is_excluded(Path::new("root/anims/other/b.gif")));
+        assert!(!control.is_excluded(Path::new("root/top.gif")));
+        assert!(!control.stopped());
+
+        out.event(Event::FileDone {
+            index: 1,
+            result: FileResult::Excluded,
+        });
+        out.event(Event::FileDone {
+            index: 2,
+            result: FileResult::Excluded,
+        });
+        run(&mut app).receive();
+        let r = run(&mut app);
+        assert!(r
+            .lines
+            .iter()
+            .any(|(_, l)| l.starts_with("Skipping folder anims:")));
+        assert_eq!((r.excluded, r.active.len()), (2, 1));
+        assert!(
+            (r.ratio() - 2.0 / 5.0).abs() < 1e-9,
+            "skipped files count as done"
+        );
+        assert!(render(&mut app, 80, 24).contains("2 skipped"));
     }
 
     #[test]
     fn log_lines_are_colored_by_kind() {
         let (tx, rx) = mpsc::channel();
-        let mut run = RunView::new(rx, Arc::new(AtomicBool::new(false)));
+        let mut run = view(rx);
         let out = Output::new(Sink::Channel(tx));
         out.block(vec![
             (Kind::Heading, "[1/2] a.gif".into()),

@@ -28,6 +28,11 @@ double-click it. An interactive screen lets you pick options and watch
 progress. You can stop a run at any time with `q`; files in progress are
 cancelled and left untouched.
 
+To skip a folder during a run, click a file in the **In progress** list (or
+select it with `Tab` and press `x`). Choose the file's folder or one of its
+parents with `←`/`→`, then confirm. GIFs being processed in that folder and
+its subfolders are cancelled, and the remaining ones are skipped.
+
 You can also drop GIFs or folders onto the executable, or run it from a
 terminal:
 

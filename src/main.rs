@@ -40,7 +40,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
@@ -48,7 +48,7 @@ use anyhow::{bail, Context, Result};
 use composite::composite_frames;
 use lzw::Effort;
 use output::{Event, FileResult, Kind, Output, Sink};
-use progress::{is_stopped, Progress, Stage};
+use progress::{cancelled, Cancelled, Control, Progress, Stage};
 use store::FrameStore;
 use timeline::{collapse_repeats, merge_consecutive, TimelineFrame};
 
@@ -255,7 +255,7 @@ fn main() {
             out.error(format!("Not logging: {e:#}"));
         }
     }
-    let code = if run_reported(&options, &out, &AtomicBool::new(false)) {
+    let code = if run_reported(&options, &out, &Control::new()) {
         0
     } else {
         1
@@ -282,12 +282,34 @@ fn open_log(out: &mut Output, options: &Options) -> Result<()> {
 }
 
 /// Runs and reports a fatal error. Returns true if everything succeeded.
-fn run_reported(options: &Options, out: &Output, stop: &AtomicBool) -> bool {
-    match run(options, out, stop) {
+fn run_reported(options: &Options, out: &Output, control: &Control) -> bool {
+    match run(options, out, control) {
         Ok(ok) => ok,
         Err(e) => {
             out.error(format!("Fatal error: {e:#}"));
             false
+        }
+    }
+}
+
+/// What happened to the GIFs one worker processed.
+#[derive(Default)]
+struct Tally {
+    errors: usize,
+    stopped: usize,
+    excluded: usize,
+    bytes_in: u64,
+    bytes_out: u64,
+}
+
+impl Tally {
+    fn add(self, o: Tally) -> Tally {
+        Tally {
+            errors: self.errors + o.errors,
+            stopped: self.stopped + o.stopped,
+            excluded: self.excluded + o.excluded,
+            bytes_in: self.bytes_in + o.bytes_in,
+            bytes_out: self.bytes_out + o.bytes_out,
         }
     }
 }
@@ -299,11 +321,24 @@ struct Job {
     dest: PathBuf,
     /// How the file is named in the output.
     name: String,
+    /// Folders that can be excluded to skip it, deepest first, with their
+    /// names. Excluding the folder everything was found in would be the
+    /// same as stopping, so it is not offered.
+    folders: Vec<(PathBuf, String)>,
 }
 
 impl Job {
     /// A job for `src`, found under `root`, named relative to `name_root`.
     fn new(root: &Path, name_root: &Path, src: PathBuf, replace: bool) -> Self {
+        let folders = src
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| *dir != name_root && dir.starts_with(name_root))
+            .map(|dir| {
+                let name = dir.strip_prefix(name_root).unwrap_or(dir);
+                (dir.to_path_buf(), name.display().to_string())
+            })
+            .collect();
         let dest = if replace {
             src.clone()
         } else {
@@ -315,7 +350,12 @@ impl Job {
             .unwrap_or(&src)
             .display()
             .to_string();
-        Self { src, dest, name }
+        Self {
+            src,
+            dest,
+            name,
+            folders,
+        }
     }
 
     /// Whether a previous run already wrote a result that is at least as
@@ -385,9 +425,9 @@ fn collect_jobs(
 }
 
 /// Returns `Ok(true)` if every GIF was processed without errors. Once
-/// `stop` is set, no further GIFs are started and those in progress are
-/// cancelled.
-fn run(options: &Options, out: &Output, stop: &AtomicBool) -> Result<bool> {
+/// `control` is stopped, no further GIFs are started and those in progress
+/// are cancelled. GIFs in folders it excludes are skipped or cancelled.
+fn run(options: &Options, out: &Output, control: &Control) -> Result<bool> {
     let base_dir = base_dir()?;
     let work_root = base_dir.join(WORK_DIR);
     out.line(if options.paths.is_empty() {
@@ -454,21 +494,29 @@ fn run(options: &Options, out: &Output, stop: &AtomicBool) -> Result<bool> {
     // completion rather than the file list.
     let next = AtomicUsize::new(0);
     let started_all = Instant::now();
-    let (errors, stopped, total_in, total_out) = std::thread::scope(|s| {
+    let tally = std::thread::scope(|s| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 s.spawn(|| {
-                    let (mut errors, mut stopped) = (0usize, 0usize);
-                    let (mut total_in, mut total_out) = (0u64, 0u64);
-                    while !stop.load(Ordering::Relaxed) {
+                    let mut t = Tally::default();
+                    while !control.stopped() {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(job) = jobs.get(i) else { break };
+                        if control.is_excluded(&job.src) {
+                            t.excluded += 1;
+                            out.event(Event::FileDone {
+                                index: i,
+                                result: FileResult::Excluded,
+                            });
+                            continue;
+                        }
                         let work_dir = work_root.join(work_dir_name(i, &job.src));
                         out.event(Event::FileStarted {
                             index: i,
                             name: job.name.clone(),
+                            folders: job.folders.clone(),
                         });
-                        let progress = Progress::new(stop, out, i);
+                        let progress = Progress::new(control, &job.src, out, i);
                         let started = Instant::now();
                         let result = process_gif(
                             &job.src,
@@ -484,23 +532,29 @@ fn run(options: &Options, out: &Output, stop: &AtomicBool) -> Result<bool> {
                         );
                         let file_result = match result {
                             Ok(r) => {
-                                total_in += r.original_size;
-                                total_out += r.output_size;
+                                t.bytes_in += r.original_size;
+                                t.bytes_out += r.output_size;
                                 out.block([vec![header], describe(&r, started)].concat());
                                 FileResult::Done(r.original_size, r.output_size)
                             }
-                            Err(e) if is_stopped(&e) => {
-                                stopped += 1;
+                            Err(e) if cancelled(&e).is_some() => {
                                 // A partial result is of no use for a later run.
                                 let _ = fs::remove_dir_all(&work_dir);
-                                out.block(vec![
-                                    header,
-                                    (Kind::Warning, "    stopped before finishing".into()),
-                                ]);
-                                FileResult::Stopped
+                                let (note, result) = match cancelled(&e) {
+                                    Some(Cancelled::Excluded) => {
+                                        t.excluded += 1;
+                                        ("skipped: its folder was excluded", FileResult::Excluded)
+                                    }
+                                    _ => {
+                                        t.stopped += 1;
+                                        ("stopped before finishing", FileResult::Stopped)
+                                    }
+                                };
+                                out.block(vec![header, (Kind::Warning, format!("    {note}"))]);
+                                result
                             }
                             Err(e) => {
-                                errors += 1;
+                                t.errors += 1;
                                 out.block(vec![
                                     header,
                                     (Kind::Error, format!("    ERROR: {e:#}")),
@@ -520,16 +574,30 @@ fn run(options: &Options, out: &Output, stop: &AtomicBool) -> Result<bool> {
                             result: file_result,
                         });
                     }
-                    (errors, stopped, total_in, total_out)
+                    t
                 })
             })
             .collect();
-        handles.into_iter().map(join).fold((0, 0, 0, 0), |a, b| {
-            (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3)
-        })
+        handles
+            .into_iter()
+            .map(join)
+            .fold(Tally::default(), Tally::add)
     });
+    let Tally {
+        errors,
+        stopped,
+        excluded,
+        bytes_in: total_in,
+        bytes_out: total_out,
+    } = tally;
 
     out.line("");
+    if excluded > 0 {
+        out.say(
+            Kind::Warning,
+            format!("Skipped {excluded} GIF(s) in excluded folders."),
+        );
+    }
     let unprocessed = jobs.len().saturating_sub(next.load(Ordering::Relaxed)) + stopped;
     if unprocessed > 0 {
         out.say(
@@ -778,8 +846,8 @@ fn run_gifsicle(input: &Path, output: &Path, progress: &Progress) -> Result<Opti
 
 /// Optimizes `src` and writes the result to `dest`, which may be `src`
 /// itself. If the result is not smaller, the original is copied to `dest`.
-/// Stops with an error as soon as `progress` reports a stop request; `dest`
-/// is then left untouched.
+/// Fails with a `Cancelled` error as soon as `progress` reports that the
+/// file was cancelled; `dest` is then left untouched.
 fn process_gif(
     src: &Path,
     dest: &Path,
@@ -1133,10 +1201,17 @@ mod tests {
     const W: u16 = 48;
     const H: u16 = 48;
 
-    static NEVER: AtomicBool = AtomicBool::new(false);
+    static NEVER: Control = Control::new();
 
     fn process(src: &Path, dest: &Path, work_dir: &Path, exact: bool) -> Result<Report> {
-        process_gif(src, dest, work_dir, exact, false, &Progress::silent(&NEVER))
+        process_gif(
+            src,
+            dest,
+            work_dir,
+            exact,
+            false,
+            &Progress::silent(&NEVER, src),
+        )
     }
 
     /// A distinct, non-trivial image per `seed` (gradient plus a moving box).
@@ -1404,6 +1479,45 @@ mod tests {
     }
 
     #[test]
+    fn excluded_folders_are_skipped() {
+        let root = std::env::temp_dir().join("gif_optimizer_test_exclude");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("skip/deeper")).unwrap();
+        for name in ["top.gif", "skip/a.gif", "skip/deeper/b.gif"] {
+            write_gif(&root.join(name), &[1, 2, 1, 2], Repeat::Infinite, false);
+        }
+        let options = Options {
+            recursive: true,
+            gifsicle: false,
+            jobs: 1,
+            paths: vec![root.clone()],
+            ..Options::default()
+        };
+        let control = Control::new();
+        control.exclude(root.join("skip"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ok = run(&options, &Output::new(Sink::Channel(tx)), &control).unwrap();
+        assert!(ok, "skipping is not a failure");
+        let out_dir = root.join(OUTPUT_DIR);
+        assert!(out_dir.join("top.gif").exists());
+        assert!(!out_dir.join("skip").exists());
+        let excluded = rx
+            .try_iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::FileDone {
+                        result: FileResult::Excluded,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(excluded, 2);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn stop_cancels_without_writing() {
         let root = std::env::temp_dir().join("gif_optimizer_test_stop");
         let _ = fs::remove_dir_all(&root);
@@ -1411,12 +1525,13 @@ mod tests {
         let src = root.join("stop.gif");
         write_gif(&src, &[1, 2, 1, 2], Repeat::Infinite, false);
         let original = fs::read(&src).unwrap();
-        let stop = AtomicBool::new(true);
-        let progress = Progress::silent(&stop);
+        let control = Control::new();
+        control.stop();
+        let progress = Progress::silent(&control, &src);
         for dest in [root.join("out.gif"), src.clone()] {
             let result = process_gif(&src, &dest, &root.join("work"), false, false, &progress);
             let e = result.err().expect("a stopped file must fail");
-            assert!(is_stopped(&e), "{e:#}");
+            assert_eq!(cancelled(&e), Some(Cancelled::Stopped), "{e:#}");
         }
         assert!(!root.join("out.gif").exists());
         assert_eq!(fs::read(&src).unwrap(), original);
@@ -1522,6 +1637,24 @@ mod tests {
                 ("single.gif".into(), "gif_optimized/single.gif".into()),
             ] as [(String, String); 3]
         );
+        // A dropped folder can be skipped itself, a dropped file has none.
+        let folders: Vec<Vec<String>> = jobs
+            .iter()
+            .map(|j| {
+                j.folders
+                    .iter()
+                    .map(|(_, n)| n.replace('\\', "/"))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            folders,
+            [vec!["anims"], vec!["anims/sub", "anims"], vec![]] as [Vec<&str>; 3]
+        );
+        assert!(jobs[1].folders[0].0.ends_with("sub"));
+        let in_base = Job::new(&root, &root, root.join("anims/a.gif"), false);
+        let names: Vec<_> = in_base.folders.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(names, ["anims"], "the base folder itself is not offered");
         fs::remove_dir_all(&root).unwrap();
     }
 
